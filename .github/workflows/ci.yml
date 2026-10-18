@@ -1,0 +1,355 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  quality:
+    name: Tests, coverage, complexity (Python 3.12)
+    runs-on: ubuntu-latest
+    # The coverage gate runs the whole suite against real servers: the
+    # PostgreSQL and MySQL branches of the schema locks and the MySQL clean-up
+    # cannot run on SQLite, and 100% measured without them would be a lie.
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: sqla
+          POSTGRES_PASSWORD: sqla
+          POSTGRES_DB: sqla
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd="pg_isready -U sqla"
+          --health-interval=2s --health-timeout=3s --health-retries=30
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_DATABASE: sqla
+          MYSQL_USER: sqla
+          MYSQL_PASSWORD: sqla
+          MYSQL_ROOT_PASSWORD: sqla
+        ports: ["3306:3306"]
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -psqla"
+          --health-interval=3s --health-timeout=5s --health-retries=40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: astral-sh/setup-uv@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install
+        run: uv pip install --system -e . --group dev
+
+      - name: Lint
+        run: |
+          ruff check .
+          ruff format --check .
+
+      - name: Typecheck
+        run: mypy
+
+      - name: Tests with coverage, on every backend, failing on any skip
+        env:
+          SQLA_TEST_POSTGRES_PSYCOPG_URL: postgresql+psycopg://sqla:sqla@127.0.0.1:5432/sqla
+          SQLA_TEST_POSTGRES_ASYNCPG_URL: postgresql+asyncpg://sqla:sqla@127.0.0.1:5432/sqla
+          SQLA_TEST_MYSQL_PYMYSQL_URL: mysql+pymysql://sqla:sqla@127.0.0.1:3306/sqla
+          SQLA_TEST_MYSQL_AIOMYSQL_URL: mysql+aiomysql://sqla:sqla@127.0.0.1:3306/sqla
+          SQLA_TEST_MYSQL_ASYNCMY_URL: mysql+asyncmy://sqla:sqla@127.0.0.1:3306/sqla
+          SQLA_TEST_REQUIRE_ALL: "1"
+        run: |
+          START=$SECONDS
+          coverage run scripts/check_no_skips.py -q
+          echo $(( (SECONDS - START) * 1000 )) > test-duration-ms.txt
+          coverage report
+          coverage json -o coverage.json
+
+      # Constitution section 8: cognitive complexity <= 15 per function.
+      # complexipy is a native binary with no dependency on a type checker, so
+      # this gate can never be held hostage by a parser's release cycle.
+      - name: Cognitive complexity gate
+        run: complexipy src/pytest_sqla --max-complexity-allowed 15
+
+      - name: Complexity report
+        run: complexipy src/pytest_sqla --output-format json --output complexity.json --quiet
+
+      - name: Restore base branch metrics
+        if: github.event_name == 'pull_request'
+        uses: actions/cache/restore@v4
+        with:
+          path: ci-data
+          key: ci-data-${{ github.base_ref }}-
+          restore-keys: ci-data-${{ github.base_ref }}-
+
+      - name: PR quality report
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const report = require('./.github/scripts/quality-report.js');
+            await report({ github, context, core });
+
+      - name: Cache metrics for the base branch
+        if: github.event_name == 'push'
+        run: |
+          mkdir -p ci-data
+          cp coverage.json ci-data/coverage.json
+          cp complexity.json ci-data/complexity.json
+          cp test-duration-ms.txt ci-data/test-duration-ms.txt
+
+      - if: github.event_name == 'push'
+        uses: actions/cache/save@v4
+        with:
+          path: ci-data
+          key: ci-data-${{ github.ref_name }}-${{ github.sha }}
+
+      - name: Step summary
+        run: |
+          python - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json
+          total = json.load(open("coverage.json"))["totals"]
+          rows = [
+              ("Statements", total["percent_covered_display"] + "%"),
+              ("Branches", f'{total["covered_branches"]}/{total["num_branches"]}'),
+              ("Missing lines", total["missing_lines"]),
+          ]
+          print("### Package quality\n")
+          print("| Metric | Value |")
+          print("| :--- | ---: |")
+          for name, value in rows:
+              print(f"| {name} | {value} |")
+          PY
+
+  test-matrix:
+    name: Python ${{ matrix.python }}
+    runs-on: ubuntu-latest
+    # The hermetic suite on every supported Python. 3.10 resolves SQLAlchemy
+    # 2.0.x by itself, because SQLAlchemy 2.1 requires Python 3.11; the others
+    # get 2.1. The real-database specs skip here, which is right for this job:
+    # the quality and integration jobs run them, and fail if they skip.
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: uv pip install --system -e . --group dev
+      - run: python -c "import sqlalchemy; print('sqlalchemy', sqlalchemy.__version__)"
+      - run: pytest -q
+
+  floor:
+    name: Oldest supported versions
+    runs-on: ubuntu-latest
+    # The declared floors: sqlalchemy>=2.0, pytest>=8.2 and, in the asyncio
+    # extra, pytest-asyncio>=1.2. pytest-asyncio 1.0 and 1.1 were measured
+    # running a test on another loop than its own scope's fixtures; 1.2 is the
+    # first that holds, and pytest 8.2 is its own floor. The loop handling is
+    # what the floor is about, so the real servers run here too.
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: sqla
+          POSTGRES_PASSWORD: sqla
+          POSTGRES_DB: sqla
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd="pg_isready -U sqla"
+          --health-interval=2s --health-timeout=3s --health-retries=30
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_DATABASE: sqla
+          MYSQL_USER: sqla
+          MYSQL_PASSWORD: sqla
+          MYSQL_ROOT_PASSWORD: sqla
+        ports: ["3306:3306"]
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -psqla"
+          --health-interval=3s --health-timeout=5s --health-retries=40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: uv pip install --system -e . --group dev
+      - run: uv pip install --system "sqlalchemy[asyncio]==2.0.0" "pytest==8.2.0" "pytest-asyncio==1.2.0"
+      - run: |
+          python -c "
+          import pytest, pytest_asyncio, sqlalchemy
+          print('sqlalchemy', sqlalchemy.__version__)
+          print('pytest', pytest.__version__, 'pytest-asyncio', pytest_asyncio.__version__)
+          "
+      - run: pytest -q
+      - name: The real-database suite on the floor, no skips
+        env:
+          SQLA_TEST_POSTGRES_PSYCOPG_URL: postgresql+psycopg://sqla:sqla@127.0.0.1:5432/sqla
+          SQLA_TEST_POSTGRES_ASYNCPG_URL: postgresql+asyncpg://sqla:sqla@127.0.0.1:5432/sqla
+          SQLA_TEST_MYSQL_PYMYSQL_URL: mysql+pymysql://sqla:sqla@127.0.0.1:3306/sqla
+          SQLA_TEST_MYSQL_AIOMYSQL_URL: mysql+aiomysql://sqla:sqla@127.0.0.1:3306/sqla
+          SQLA_TEST_MYSQL_ASYNCMY_URL: mysql+asyncmy://sqla:sqla@127.0.0.1:3306/sqla
+          SQLA_TEST_REQUIRE_ALL: "1"
+        run: python scripts/check_no_skips.py tests/integration -q
+
+  sqlalchemy-2-0:
+    name: Newest SQLAlchemy 2.0
+    runs-on: ubuntu-latest
+    # Every other job on Python 3.11+ resolves SQLAlchemy 2.1, and the floor
+    # job pins 2.0.0. This keeps the newest 2.0.x proven too, examples included.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: uv pip install --system -e . --group dev "sqlalchemy[asyncio]>=2.0,<2.1"
+      - run: python -c "import sqlalchemy; assert sqlalchemy.__version__.startswith('2.0.'), sqlalchemy.__version__; print(sqlalchemy.__version__)"
+      - run: pytest -q
+      - run: uv pip install --system -r examples/requirements.txt "sqlalchemy[asyncio]>=2.0,<2.1"
+      - run: pytest examples -q
+
+  sync-only:
+    name: Sync-only install
+    runs-on: ubuntu-latest
+    # What `pip install pytest-sqla` gives you on SQLAlchemy 2.1: no
+    # pytest-asyncio, no anyio, no greenlet, no aiosqlite. The plugin must load,
+    # every sync fixture must work, and an async fixture must fail with
+    # pytest-sqla's own message rather than an ImportError.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: uv pip install --system . pytest
+      - name: The environment really lacks the async stack
+        run: |
+          for module in greenlet pytest_asyncio anyio aiosqlite; do
+            if python -c "import $module" 2>/dev/null; then
+              echo "::error::$module is installed; this job proves nothing"
+              exit 1
+            fi
+          done
+      # pyproject.toml configures pytest-asyncio for the full suite; without
+      # it installed, those keys are unknown and filterwarnings = error would
+      # stop pytest before collection. Only that warning is let through.
+      - run: pytest tests/sync -q -W "ignore:Unknown config option:pytest.PytestConfigWarning"
+
+  integration:
+    name: Real databases (PostgreSQL 17 + MySQL 8.4)
+    runs-on: ubuntu-latest
+    # SQLite is in-process, has transactional DDL, and does not care which
+    # event loop calls it. PostgreSQL aborts transactions on error, MySQL
+    # commits DDL on its own, and asyncpg, aiomysql and asyncmy break when a
+    # connection crosses event loops: the things pytest-sqla exists for.
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: sqla
+          POSTGRES_PASSWORD: sqla
+          POSTGRES_DB: sqla
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd="pg_isready -U sqla"
+          --health-interval=2s --health-timeout=3s --health-retries=30
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_DATABASE: sqla
+          MYSQL_USER: sqla
+          MYSQL_PASSWORD: sqla
+          MYSQL_ROOT_PASSWORD: sqla
+        ports: ["3306:3306"]
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -psqla"
+          --health-interval=3s --health-timeout=5s --health-retries=40
+    env:
+      SQLA_TEST_POSTGRES_PSYCOPG_URL: postgresql+psycopg://sqla:sqla@127.0.0.1:5432/sqla
+      SQLA_TEST_POSTGRES_ASYNCPG_URL: postgresql+asyncpg://sqla:sqla@127.0.0.1:5432/sqla
+      SQLA_TEST_MYSQL_PYMYSQL_URL: mysql+pymysql://sqla:sqla@127.0.0.1:3306/sqla
+      SQLA_TEST_MYSQL_AIOMYSQL_URL: mysql+aiomysql://sqla:sqla@127.0.0.1:3306/sqla
+      SQLA_TEST_MYSQL_ASYNCMY_URL: mysql+asyncmy://sqla:sqla@127.0.0.1:3306/sqla
+      # A missing URL or driver fails instead of skipping.
+      SQLA_TEST_REQUIRE_ALL: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: uv pip install --system -e . --group dev
+      - run: uv pip install --system -r examples/requirements.txt
+
+      # Fails when anything skipped, from any source: a skipped suite that
+      # reports green looks like coverage that is not there. Includes the
+      # pytest-xdist runs against both servers.
+      - name: The real-database suite, every driver, no skips
+        run: python scripts/check_no_skips.py tests/integration -v
+
+      - name: The examples on PostgreSQL
+        env:
+          PYTEST_SQLA_URL: ${{ env.SQLA_TEST_POSTGRES_PSYCOPG_URL }}
+          PYTEST_SQLA_ASYNC_URL: ${{ env.SQLA_TEST_POSTGRES_ASYNCPG_URL }}
+        run: python scripts/check_no_skips.py examples -q
+
+      - name: The examples on MySQL
+        env:
+          PYTEST_SQLA_URL: ${{ env.SQLA_TEST_MYSQL_PYMYSQL_URL }}
+          PYTEST_SQLA_ASYNC_URL: ${{ env.SQLA_TEST_MYSQL_AIOMYSQL_URL }}
+        run: python scripts/check_no_skips.py examples -q
+
+  examples:
+    name: Examples
+    runs-on: ubuntu-latest
+    # The examples are validation, not decoration: each one's second test
+    # asserts the first test's commits were rolled back.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: uv pip install --system -e . --group dev
+      - run: uv pip install --system -r examples/requirements.txt
+      - run: pytest examples -q
+
+  packaging:
+    name: Packaging and supply chain
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: uv pip install --system -e . --group dev
+
+      - name: Build and check distributions
+        run: |
+          python -m build
+          twine check dist/*
+
+      - name: Consumer smoke test against the built wheel
+        run: python scripts/check_packed_consumer.py
+
+      # Audits the published closure only - what `pip install
+      # "pytest-sqla[asyncio]"` pulls in. Dev-tooling advisories are
+      # Dependabot's job and do not block a release.
+      - name: Audit the production surface
+        run: python scripts/audit_production_surface.py
