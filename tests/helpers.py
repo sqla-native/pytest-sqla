@@ -109,12 +109,12 @@ class Project:
         self.pytester.makepyfile(**{name: textwrap.dedent(source)})
         return self
 
-    def _write_ini(self) -> None:
+    def write_ini(self) -> None:
         lines = ["[pytest]", *(f"{key} = {value}" for key, value in self.settings.items())]
         (self.path / "pytest.ini").write_text("\n".join(lines) + "\n")
 
     def run(self, *args: str) -> pytest.RunResult:
-        self._write_ini()
+        self.write_ini()
         result = self.pytester.runpytest(*args)
         if LEAKS_EVENT_LOOPS:
             with warnings.catch_warnings():
@@ -122,9 +122,10 @@ class Project:
                 gc.collect()
         return result
 
-    def run_subprocess(self, *args: str) -> pytest.RunResult:
-        self._write_ini()
-        return self.pytester.runpytest_subprocess(*args)
+    def run_subprocess(self, *args: str, timeout: float | None = None) -> pytest.RunResult:
+        """A pytest of its own; ``timeout`` fails the outer test instead of hanging it."""
+        self.write_ini()
+        return self.pytester.runpytest_subprocess(*args, timeout=timeout)
 
 
 def table_names(url: str) -> list[str]:

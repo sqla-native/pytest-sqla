@@ -332,6 +332,21 @@ def test_the_guard_reports_a_thread_with_no_running_loop() -> None:
     ]
 
 
+def test_the_guard_lets_a_callback_on_the_right_loop_through() -> None:
+    """Called directly: a callback has no task to record, and is still on the right loop."""
+    import asyncio
+
+    from pytest_sqla._asyncio import LoopGuard
+
+    loop = asyncio.new_event_loop()
+    guard = LoopGuard(loop, "test_x.py::test_y", "function", "sqla_async_connection")
+    done = loop.create_future()
+    loop.call_soon(lambda: done.set_result(guard()))
+    loop.run_until_complete(done)
+    loop.close()
+    assert list(guard.tasks) == []
+
+
 def test_an_app_on_its_own_loop_in_a_thread_is_reported(project: Project) -> None:
     """The shape of Starlette's TestClient: the app runs on a loop of its own."""
     loop_project(project, "strict")
@@ -388,5 +403,160 @@ def test_a_missing_greenlet_is_reported(project: Project, monkeypatch: pytest.Mo
         [
             "*pytest-sqla: sqla_async_session needs greenlet, which SQLAlchemy 2.1 no longer "
             "installs by default. Install pytest-sqla[[]asyncio] (or sqlalchemy[[]asyncio])."
+        ]
+    )
+
+
+@pytest.mark.parametrize("call", ["rollback", "commit"])
+def test_a_root_commit_or_rollback_from_another_loop_is_stopped(
+    project: Project, call: str
+) -> None:
+    """They reach the driver without a statement. Measured before: a cross-loop root
+    rollback raised a raw RuntimeError on asyncpg, aiomysql and asyncmy and left the
+    pooled connection out of step for the next test; aiosqlite let both through, and the
+    commit made the next test count a row."""
+    loop_project(project, "strict")
+    project.tests(
+        f"""
+        import pytest
+        import pytest_asyncio
+        from sqlalchemy import insert
+        from models import User, acount
+
+        @pytest_asyncio.fixture
+        async def ends_it_on_the_function_loop(sqla_async_connection):
+            yield
+            await sqla_async_connection.{call}()
+
+        @pytest.mark.asyncio(loop_scope="module")
+        async def test_module_loop(ends_it_on_the_function_loop, sqla_async_connection):
+            await sqla_async_connection.execute(insert(User).values(email="ada@example.com"))
+
+        @pytest.mark.asyncio(loop_scope="module")
+        async def test_next(sqla_async_session):
+            assert await acount(sqla_async_session) == 0
+        """
+    )
+    result = project.run()
+    result.assert_outcomes(passed=2, errors=1)
+    result.stdout.fnmatch_lines(
+        [
+            "*ERROR at teardown of test_module_loop*",
+            "E *pytest_sqla.LoopMismatchError: pytest-sqla: sqla_async_connection belongs to the "
+            "event loop test_inner.py::test_module_loop runs on (pytest-asyncio loop scope "
+            "'module'), but it was used from a different event loop.*",
+        ]
+    )
+    result.stdout.no_fnmatch_line("*IsolationError*")
+
+
+def test_a_thread_is_stopped_before_sqlalchemy_makes_a_cursor(project: Project) -> None:
+    """aiosqlite awaits to make a cursor, and SQLAlchemy raised MissingGreenlet there before
+    before_cursor_execute could run; before_execute comes first. exec_driver_sql() has no
+    before_execute event, so it still meets MissingGreenlet in a thread on aiosqlite."""
+    loop_project(project, "strict")
+    project.tests(
+        """
+        import asyncio
+        import pytest
+        from sqlalchemy import text
+        from pytest_sqla import LoopMismatchError
+
+        @pytest.mark.asyncio
+        async def test_from_a_thread(sqla_async_connection):
+            sync_connection = sqla_async_connection.sync_connection
+            with pytest.raises(LoopMismatchError, match="a thread with no running event loop"):
+                await asyncio.to_thread(sync_connection.execute, text("SELECT 1"))
+            assert await sqla_async_connection.scalar(text("SELECT 1")) == 1
+        """
+    )
+    project.run().assert_outcomes(passed=1)
+
+
+# ---------------------------------------- anyio_backend in a pytest-asyncio test
+
+ANYIO_HELPER = (
+    CONFTEST
+    + '''
+@pytest.fixture
+def needs_anyio_backend(anyio_backend):
+    """A helper written for anyio tests, reused by a pytest-asyncio test."""
+    return anyio_backend
+'''
+)
+HELPER_TEST = """
+import pytest
+from models import User, acount
+
+{marker}
+async def test_helper(needs_anyio_backend, sqla_async_session):
+    sqla_async_session.add(User(email="ada@example.com"))
+    await sqla_async_session.commit()
+    assert await acount(sqla_async_session) == 1
+"""
+
+
+@pytest.mark.parametrize("mode", ["strict", "auto"])
+def test_pytest_asyncio_runs_its_test_even_with_anyio_backend_among_its_fixtures(
+    project: Project, mode: str
+) -> None:
+    """Routed by is_async_test() first. Measured before: the strict test got a connection
+    from anyio's loop, and the auto one was refused as "an anyio test" it was not.
+
+    ``-p anyio`` registers anyio first, which puts pytest-asyncio's fixture wrapper
+    outermost: then pytest-asyncio runs every async fixture of its tests.
+    """
+    loop_project(project, mode)
+    project.conftest(ANYIO_HELPER)
+    marker = "@pytest.mark.asyncio" if mode == "strict" else ""
+    project.tests(HELPER_TEST.format(marker=marker))
+    project.run("-p", "anyio").assert_outcomes(passed=1)
+
+
+def test_with_anyio_wrapping_the_fixtures_the_guard_names_the_cause(project: Project) -> None:
+    """``-p asyncio`` registers pytest-asyncio first: anyio's fixture wrapper is then
+    outermost and runs every async fixture, pytest_asyncio ones included, on anyio's loop.
+
+    In process, the stdlib asyncio is already imported, which pytest warns about when
+    ``-p asyncio`` marks that name for assertion rewriting.
+    """
+    loop_project(project, "strict")
+    project.conftest(ANYIO_HELPER)
+    project.tests(HELPER_TEST.format(marker="@pytest.mark.asyncio"))
+    result = project.run("-p", "asyncio", "-W", "ignore::pytest.PytestAssertRewriteWarning")
+    result.assert_outcomes(failed=1)
+    result.stdout.fnmatch_lines(
+        [
+            "E *pytest_sqla.LoopMismatchError: pytest-sqla: sqla_async_session was opened on "
+            "another event loop than the one test_inner.py::test_helper runs on. pytest-asyncio "
+            "runs this test, but anyio_backend is among its fixtures, directly or through a "
+            "fixture it uses, and anyio then runs async fixtures, pytest-sqla's included, on an "
+            "event loop of its own. Keep anyio_backend out of this test's fixtures, or make it "
+            "an anyio test with @pytest.mark.anyio."
+        ]
+    )
+
+
+def test_a_sync_test_with_an_async_fixture_is_told_it_is_synchronous(project: Project) -> None:
+    """Measured before: "no async plugin runs" it, with pytest-asyncio running the fixture."""
+    loop_project(project, "strict")
+    project.tests(
+        """
+        import pytest_asyncio
+
+        @pytest_asyncio.fixture
+        async def seeded(sqla_async_session):
+            return "seeded"
+
+        def test_sync(seeded):
+            assert seeded == "seeded"
+        """
+    )
+    result = project.run()
+    result.assert_outcomes(errors=1)
+    result.stdout.fnmatch_lines(
+        [
+            "*pytest-sqla: sqla_async_session needs an async test, but "
+            "test_inner.py::test_sync is a plain def.*"
         ]
     )

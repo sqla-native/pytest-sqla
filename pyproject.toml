@@ -79,6 +79,8 @@ dev = [
     "cryptography>=42",
     "build>=1.0",
     "twine>=5.0",
+    # The README's Alembic recipe runs as a test.
+    "alembic>=1.13",
 ]
 
 [tool.hatch.build.targets.wheel]
@@ -100,6 +102,10 @@ source = ["pytest_sqla"]
 # supported version runs, so pin it and keep 3.14 identical to the rest. A
 # non-empty COVERAGE_CORE in the environment still overrides this.
 core = "ctrace"
+# SQLAlchemy's asyncio extension runs the sync code in greenlets. Traced as
+# threads only, coverage lost the line after an await whose greenlet switched
+# away mid-call (measured: the return after `await connection.invalidate()`).
+concurrency = ["thread", "greenlet"]
 
 [tool.coverage.report]
 # Constitution section 7: the 100% bar governs src/pytest_sqla only, measured

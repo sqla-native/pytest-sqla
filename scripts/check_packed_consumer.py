@@ -153,7 +153,10 @@ def main() -> int:
         )
         print(checked(python, "-m", "pytest", "test_sync.py", cwd=sync).splitlines()[-1])
         refused = run(python, "-m", "pytest", "test_wants_async.py", cwd=sync)
-        expected = "sqla_async_session needs an async test, but no async plugin runs"
+        expected = (
+            "sqla_async_session needs an async test, but test_wants_async.py::test_wants_async "
+            "is a plain def"
+        )
         if refused.returncode == 0 or expected not in refused.stdout:
             print(refused.stdout, refused.stderr, sep="\n", file=sys.stderr)
             raise SystemExit("an async fixture on a plain install must fail with F5")

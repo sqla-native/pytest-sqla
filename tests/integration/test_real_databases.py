@@ -250,7 +250,7 @@ def test_another_runs_schema_is_refused_then_recreated(
     refused.stdout.fnmatch_lines(
         [
             "*holds the schema of another pytest-sqla run (started 2026-10-18T09:00:00+00:00 by "
-            "ci:1/gw2; 3 worker(s) never finished)*"
+            "ci:1/gw2; 3 worker(s) still running, or crashed)*"
         ]
     )
     recreated = project.run("--sqla-url", sync_database.url, "--sqla-recreate-schema")
@@ -567,3 +567,464 @@ def test_without_the_guard_crossing_loops_fails(async_database: Database) -> Non
         assert crossed is not None
         assert "attached to a different loop" in crossed
         assert usable is (name != "postgresql+asyncpg")
+
+
+# ------------------------------------------------------- MySQL deadlocks
+
+DEADLOCK = """
+import asyncio
+import threading
+import time
+
+import pytest
+from sqlalchemy import create_engine, insert, text
+from sqlalchemy.exc import OperationalError
+from sqlalchemy.pool import NullPool
+from models import User
+
+OTHER_URL = {other_url!r}
+
+
+class Other:
+    '''A second transaction that holds bob@ and then waits for ada@, which the test holds.
+
+    It writes more rows than the test, so InnoDB picks the test's transaction as
+    the deadlock victim and rolls all of it back, savepoints included.
+    '''
+
+    def __enter__(self):
+        self.engine = create_engine(OTHER_URL, poolclass=NullPool)
+        self.connection = self.engine.connect()
+        rows = [{{"email": f"other-{{n}}@example.com"}} for n in range(50)]
+        self.connection.execute(insert(User), rows)
+        self.connection.execute(insert(User).values(email="bob@example.com"))
+        self.thread = threading.Thread(target=self.wait_for_ada)
+        return self
+
+    def wait_for_ada(self):
+        self.connection.execute(insert(User).values(email="ada@example.com"))
+
+    def start(self):
+        self.thread.start()
+        time.sleep(0.5)
+
+    def __exit__(self, *_):
+        if self.thread.ident is not None:
+            self.thread.join()
+        self.connection.rollback()
+        self.connection.close()
+        self.engine.dispose()
+
+
+def errno(raised):
+    return raised.value.orig.args[0]
+"""
+
+SYNC_DEADLOCKS = """
+from sqlalchemy import func, select
+
+def count(session):
+    return session.scalar(select(func.count()).select_from(User))
+
+def test_a_flush_raises_the_deadlock_itself(sqla_session):
+    with Other() as other:
+        sqla_session.add(User(email="ada@example.com"))
+        sqla_session.flush()
+        other.start()
+        sqla_session.add(User(email="bob@example.com"))
+        with pytest.raises(OperationalError) as raised:
+            sqla_session.flush()
+    assert errno(raised) == 1213, "measured before: 1305, SAVEPOINT sa_savepoint_2 does not exist"
+    sqla_session.rollback()
+
+def test_the_rollback_after_a_deadlock_works_and_a_retry_commits(sqla_session):
+    with Other() as other:
+        sqla_session.execute(insert(User).values(email="ada@example.com"))
+        other.start()
+        with pytest.raises(OperationalError) as raised:
+            sqla_session.execute(insert(User).values(email="bob@example.com"))
+    assert errno(raised) == 1213
+    sqla_session.rollback()  # measured before: it raised 1305 as well
+    sqla_session.add(User(email="retry@example.com"))
+    sqla_session.commit()
+    assert count(sqla_session) == 1
+
+def test_ddl_after_a_deadlock_is_still_reported(sqla_session):
+    with Other() as other:
+        sqla_session.execute(insert(User).values(email="ada@example.com"))
+        other.start()
+        with pytest.raises(OperationalError):
+            sqla_session.execute(insert(User).values(email="bob@example.com"))
+    sqla_session.rollback()
+    sqla_session.execute(text("CREATE TABLE it_extra (id INTEGER)"))
+
+def test_nothing_was_committed(sqla_session):
+    assert count(sqla_session) == 0
+"""
+
+ASYNC_DEADLOCKS = """
+from sqlalchemy import func, select
+
+pytestmark = pytest.mark.asyncio
+
+async def count(session):
+    return await session.scalar(select(func.count()).select_from(User))
+
+async def test_a_flush_raises_the_deadlock_itself(sqla_async_session):
+    with Other() as other:
+        sqla_async_session.add(User(email="ada@example.com"))
+        await sqla_async_session.flush()
+        other.start()
+        sqla_async_session.add(User(email="bob@example.com"))
+        with pytest.raises(OperationalError) as raised:
+            await sqla_async_session.flush()
+    assert errno(raised) == 1213
+    await sqla_async_session.rollback()
+
+async def test_the_rollback_after_a_deadlock_works_and_a_retry_commits(sqla_async_session):
+    with Other() as other:
+        await sqla_async_session.execute(insert(User).values(email="ada@example.com"))
+        other.start()
+        with pytest.raises(OperationalError) as raised:
+            await sqla_async_session.execute(insert(User).values(email="bob@example.com"))
+    assert errno(raised) == 1213
+    await sqla_async_session.rollback()
+    sqla_async_session.add(User(email="retry@example.com"))
+    await sqla_async_session.commit()
+    assert await count(sqla_async_session) == 1
+
+async def test_nothing_was_committed(sqla_async_session):
+    assert await count(sqla_async_session) == 0
+"""
+
+
+def test_a_mysql_deadlock_is_not_a_breach(project: Project, mysql_database: Database) -> None:
+    """InnoDB rolls the victim's whole transaction back; nothing was committed.
+
+    Measured before the repair: the application saw (1305, 'SAVEPOINT sa_savepoint_2
+    does not exist') instead of the deadlock, and every victim failed its teardown with
+    an IsolationError claiming its rows were permanent.
+    """
+    result = inner(
+        project,
+        mysql_database,
+        DEADLOCK.format(other_url=sync_twin(mysql_database.url)) + SYNC_DEADLOCKS,
+    )
+    result.assert_outcomes(passed=4, errors=1)
+    result.stdout.fnmatch_lines(
+        [
+            "*ERROR at teardown of test_ddl_after_a_deadlock_is_still_reported*",
+            "*IsolationError: pytest-sqla: the database ended test_inner.py::"
+            "test_ddl_after_a_deadlock_is_still_reported's transaction on its own*",
+        ]
+    )
+
+
+def test_an_async_mysql_deadlock_is_not_a_breach(
+    project: Project, async_mysql_database: Database
+) -> None:
+    result = inner(
+        project,
+        async_mysql_database,
+        DEADLOCK.format(other_url=sync_twin(async_mysql_database.url)) + ASYNC_DEADLOCKS,
+    )
+    result.assert_outcomes(passed=3)
+
+
+# ------------------------------------------------------------ session state
+
+SESSION_STATE = {
+    "mysql": ("SET FOREIGN_KEY_CHECKS = 0", "SELECT @@SESSION.foreign_key_checks", 1),
+    "postgresql": (
+        "SELECT pg_advisory_lock(4242)",
+        "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND objid = 4242",
+        0,
+    ),
+}
+
+
+def test_session_state_does_not_reach_the_next_test(
+    project: Project, sync_database: Database
+) -> None:
+    """ROLLBACK undoes neither; measured with a pooled sync engine, both reached the next test."""
+    set_it, read_it, expected = SESSION_STATE[sync_database.family]
+    result = inner(
+        project,
+        sync_database,
+        f"""
+        from sqlalchemy import text
+
+        def test_sets_it(sqla_connection):
+            sqla_connection.execute(text({set_it!r}))
+
+        def test_next(sqla_connection):
+            assert sqla_connection.scalar(text({read_it!r})) == {expected!r}
+        """,
+    )
+    result.assert_outcomes(passed=2)
+
+
+QUEUE_POOL = """
+import pytest
+from sqlalchemy.pool import QueuePool
+
+@pytest.fixture(scope="session")
+def sqla_engine_options():
+    return {"poolclass": QueuePool}
+"""
+
+
+def test_a_mysql_connection_set_to_autocommit_is_not_handed_on(
+    project: Project, mysql_database: Database
+) -> None:
+    """With a pool of your own. Measured before: after SET autocommit = 1 every later test
+    committed for real and failed its teardown with a breach of its own."""
+    project.models()
+    project.conftest(ANYIO + QUEUE_POOL)
+    project.tests(
+        """
+        from models import User, count
+
+        def test_culprit(sqla_connection):
+            sqla_connection.exec_driver_sql("SET autocommit = 1")
+
+        def test_innocent(sqla_session):
+            sqla_session.add(User(email="innocent@example.com"))
+            sqla_session.commit()
+
+        def test_still_innocent(sqla_session):
+            assert count(sqla_session) == 0
+        """
+    )
+    result = project.run("--sqla-url", mysql_database.url)
+    result.assert_outcomes(passed=3, errors=1)
+    result.stdout.fnmatch_lines(["*ERROR at teardown of test_culprit*"])
+
+
+def test_an_async_mysql_connection_set_to_autocommit_is_not_handed_on(
+    project: Project, async_mysql_database: Database
+) -> None:
+    """A module loop's pooled engine, the async way to share connections between tests."""
+    result = inner(
+        project,
+        async_mysql_database,
+        """
+        import pytest
+        from models import User, acount
+
+        pytestmark = pytest.mark.asyncio(loop_scope="module")
+
+        async def test_culprit(sqla_async_connection):
+            await sqla_async_connection.exec_driver_sql("SET autocommit = 1")
+
+        async def test_innocent(sqla_async_session):
+            sqla_async_session.add(User(email="innocent@example.com"))
+            await sqla_async_session.commit()
+
+        async def test_still_innocent(sqla_async_session):
+            assert await acount(sqla_async_session) == 0
+        """,
+    )
+    result.assert_outcomes(passed=3, errors=1)
+    result.stdout.fnmatch_lines(["*ERROR at teardown of test_culprit*"])
+
+
+# ------------------------------------------------- engines and tasks of the test
+
+
+def test_a_commit_on_a_second_connection_of_the_engine_is_reported(
+    project: Project, sync_database: Database
+) -> None:
+    result = inner(
+        project,
+        sync_database,
+        """
+        from sqlalchemy import text
+        from models import count
+
+        def test_escapes(sqla_session):
+            with sqla_session.get_bind().engine.begin() as other:
+                other.execute(text("INSERT INTO user_account (email) VALUES ('audit')"))
+
+        def test_later(sqla_session):
+            assert count(sqla_session) == 1, "the leak is real, which is why it is an error"
+        """,
+    )
+    result.assert_outcomes(passed=2, errors=1)
+    result.stdout.fnmatch_lines(
+        ["*IsolationError: pytest-sqla: test_inner.py::test_escapes committed on a second conn*"]
+    )
+
+
+def test_an_async_commit_on_a_second_connection_is_reported(
+    project: Project, async_database: Database
+) -> None:
+    result = inner(
+        project,
+        async_database,
+        """
+        import pytest
+        from sqlalchemy import text
+        from models import acount
+
+        pytestmark = pytest.mark.asyncio
+
+        async def test_escapes(sqla_async_connection):
+            async with sqla_async_connection.engine.begin() as other:
+                await other.execute(text("INSERT INTO user_account (email) VALUES ('audit')"))
+
+        async def test_later(sqla_async_session):
+            assert await acount(sqla_async_session) == 1
+        """,
+    )
+    result.assert_outcomes(passed=2, errors=1)
+    result.stdout.fnmatch_lines(
+        ["*IsolationError: pytest-sqla: test_inner.py::test_escapes committed on a second conn*"]
+    )
+
+
+def test_a_task_left_running_cannot_hang_or_break_the_teardown(
+    project: Project, async_database: Database
+) -> None:
+    """Measured before: asyncmy hung the run forever (killed by a 60 s alarm); asyncpg,
+    aiomysql and psycopg failed the teardown with driver errors or a SAWarning.
+
+    A subprocess with a timeout, so that a hang fails this test instead of the CI job.
+    """
+    project.models()
+    project.conftest(ANYIO)
+    project.tests(
+        """
+        import asyncio
+        import pytest
+        from models import User, acount
+
+        pytestmark = pytest.mark.asyncio
+
+        async def test_fire_and_forget(sqla_async_sessionmaker):
+            async def audit():
+                async with sqla_async_sessionmaker() as session:
+                    session.add(User(email="audit@example.com"))
+                    await session.commit()
+
+            asyncio.create_task(audit())
+
+        async def test_next(sqla_async_session):
+            assert await acount(sqla_async_session) == 0
+        """
+    )
+    result = project.run_subprocess("--sqla-url", async_database.url, timeout=120)
+    result.assert_outcomes(passed=2, errors=1)
+    result.stdout.fnmatch_lines(
+        ["*IsolationError: pytest-sqla: test_inner.py::test_fire_and_forget left 1 task(s)*"]
+    )
+
+
+@pytest.mark.parametrize("call", ["rollback", "commit"])
+def test_a_root_commit_or_rollback_from_another_loop_is_stopped(
+    project: Project, async_database: Database, call: str
+) -> None:
+    """Measured before: a raw RuntimeError, and on aiomysql and asyncmy the next test on
+    the module loop's pooled connection failed with "This result object does not return
+    rows"."""
+    result = inner(
+        project,
+        async_database,
+        f"""
+        import pytest
+        import pytest_asyncio
+        from sqlalchemy import insert
+        from models import User, acount
+
+        @pytest_asyncio.fixture
+        async def ends_it_on_the_function_loop(sqla_async_connection):
+            yield
+            await sqla_async_connection.{call}()
+
+        @pytest.mark.asyncio(loop_scope="module")
+        async def test_module_loop(ends_it_on_the_function_loop, sqla_async_connection):
+            await sqla_async_connection.execute(insert(User).values(email="ada@example.com"))
+
+        @pytest.mark.asyncio(loop_scope="module")
+        async def test_next(sqla_async_session):
+            assert await acount(sqla_async_session) == 0
+        """,
+    )
+    result.assert_outcomes(passed=2, errors=1)
+    result.stdout.fnmatch_lines(["*LoopMismatchError: pytest-sqla: sqla_async_connection belongs*"])
+    assert "IsolationError" not in result.stdout.str()
+
+
+# ------------------------------------------------- creation behind a live run
+
+
+def test_recreating_the_schema_of_a_live_run_times_out_with_an_explanation(
+    project: Project, sync_database: Database
+) -> None:
+    """Measured before: the raw LockNotAvailable or (1205, 'Lock wait timeout exceeded')."""
+    run_twin(
+        sync_database,
+        "CREATE TABLE pytest_sqla (run_id VARCHAR(64) PRIMARY KEY, workers INTEGER NOT NULL, "
+        "started_at VARCHAR(32) NOT NULL, owner VARCHAR(255) NOT NULL)",
+        "INSERT INTO pytest_sqla VALUES ('live', 1, '2026-10-18T09:00:00+00:00', 'ci:1/main')",
+        "CREATE TABLE user_account (id INTEGER PRIMARY KEY, email VARCHAR(100))",
+    )
+    engine = create_engine(sync_twin(sync_database.url), poolclass=NullPool)
+    live = engine.connect()
+    live.begin()
+    live.execute(text("SELECT count(*) FROM user_account"))  # a test of the live run
+    try:
+        project.ini(sqla_lock_timeout="1")
+        project.models()
+        project.tests("def test_db(sqla_session):\n    pass\n")
+        result = project.run("--sqla-url", sync_database.url, "--sqla-recreate-schema")
+    finally:
+        live.rollback()
+        live.close()
+        engine.dispose()
+    result.assert_outcomes(errors=1)
+    result.stdout.fnmatch_lines(
+        [
+            "*SchemaConflictError: pytest-sqla: gave up after 1 s waiting for a lock on the "
+            f"tables of the test schema in {rendered(sync_database)}: another connection holds "
+            "one, usually a test of the pytest-sqla run whose schema this is, still going.*"
+        ]
+    )
+
+
+# ---------------------------------------------------- the README's Alembic recipe
+
+ALEMBIC_ROLE = "pytest_sqla_alembic"
+
+
+def drop_alembic_role(database: Database) -> None:
+    engine = create_engine(sync_twin(database.url), poolclass=NullPool)
+    try:
+        with engine.begin() as connection:
+            if connection.scalar(text(f"SELECT 1 FROM pg_roles WHERE rolname = '{ALEMBIC_ROLE}'")):
+                connection.execute(text(f"DROP OWNED BY {ALEMBIC_ROLE}"))
+                connection.execute(text(f"DROP ROLE {ALEMBIC_ROLE}"))
+    finally:
+        engine.dispose()
+
+
+def test_the_alembic_recipe_with_a_password_that_needs_escaping(
+    project: Project, postgresql_database: Database
+) -> None:
+    """Measured before: Alembic's config raised "invalid interpolation syntax" on it."""
+    from tests.sync.test_alembic_recipe import alembic_project, readme_recipe
+
+    password = "p@ss%w:rd/1"
+    drop_alembic_role(postgresql_database)
+    run_twin(
+        postgresql_database,
+        f"CREATE ROLE {ALEMBIC_ROLE} LOGIN PASSWORD '{password}'",
+        f"GRANT CREATE, USAGE ON SCHEMA public TO {ALEMBIC_ROLE}",
+    )
+    try:
+        url = make_url(postgresql_database.url).set(username=ALEMBIC_ROLE, password=password)
+        alembic_project(project, readme_recipe())
+        result = project.run("--sqla-url", url.render_as_string(hide_password=False))
+    finally:
+        drop_alembic_role(postgresql_database)
+    result.assert_outcomes(passed=2)

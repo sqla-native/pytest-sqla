@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import contextlib
 import importlib
-import sqlite3
 from collections.abc import AsyncIterator, Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -34,6 +33,8 @@ from ._engines import async_engine, sync_engine
 from ._isolation import Isolation, check_session_options, end_isolation, open_isolation
 
 if TYPE_CHECKING:
+    import sqlite3
+
     from sqlalchemy.ext.asyncio import (
         AsyncConnection,
         AsyncEngine,
@@ -71,7 +72,12 @@ def pytest_configure(config: pytest.Config) -> None:
 
 
 def pytest_report_header(config: pytest.Config) -> list[str]:
-    """Say which database a run used, so a green CI log shows what it proved."""
+    """Say which database the run is configured for, so a green CI log shows what it proved.
+
+    This is the configuration: an override of the sqla_url fixture, such as a
+    container's URL, is not known before the first database test, and the
+    connected URL is ``sqla_connection.engine.url``.
+    """
     settings = config.stash[SETTINGS]
     parts = [
         f"{label}={_config.render(configured.url)} (from {configured.source})"
@@ -135,9 +141,12 @@ def sqla_engine_options() -> dict[str, Any]:
     """Extra keyword arguments for every engine pytest-sqla creates. Default ``{}``.
 
     For example ``echo``, ``connect_args``, ``json_serializer`` or
-    ``execution_options``. Refused: ``poolclass`` for async engines, and
-    anything that commits each statement (``isolation_level="AUTOCOMMIT"``,
-    sqlite3's ``autocommit=True``).
+    ``execution_options``. Refused: ``poolclass`` and ``pool`` for async
+    engines; anything that commits each statement, such as
+    ``isolation_level="AUTOCOMMIT"`` or ``autocommit=True`` in
+    ``connect_args``; and ``isolation_level="READ UNCOMMITTED"``, which lets a
+    test read other workers' rows. The sync engine is NullPool unless these
+    choose a pool.
     """
     return {}
 
@@ -251,6 +260,7 @@ def _sqla_sqlite_keeper(_sqla_urls: Targets) -> Iterator[sqlite3.Connection | No
 def _sqla_sync_engine(
     _sqla_urls: Targets, sqla_engine_options: dict[str, Any], _sqla_sqlite_keeper: object
 ) -> Iterator[Engine]:
+    """NullPool, unless sqla_engine_options choose a pool: see ``_engines``."""
     assert _sqla_urls.sync is not None, "the dispatcher checked the URL"
     engine = sync_engine(_sqla_urls.sync, sqla_engine_options)
     yield engine
@@ -281,21 +291,26 @@ def _sqla_sync_transaction(
     check_session_options(sqla_session_options)
     with _sqla_sync_engine.connect() as connection:
         isolation = open_isolation(connection)
-        state = _SyncState(
-            connection=connection,
-            isolation=isolation,
-            sessionmaker=sessionmaker(
-                bind=connection, join_transaction_mode="create_savepoint", **sqla_session_options
-            ),
-        )
-        yield state
-        if state.session is not None:
-            # A failure here is explained by end_isolation when it matters.
-            with contextlib.suppress(DBAPIError):
-                state.session.close()
-        breach = end_isolation(
-            isolation, nodeid=request.node.nodeid, fixture=state.fixture or "sqla_connection"
-        )
+        try:
+            state = _SyncState(
+                connection=connection,
+                isolation=isolation,
+                sessionmaker=sessionmaker(
+                    bind=connection,
+                    join_transaction_mode="create_savepoint",
+                    **sqla_session_options,
+                ),
+            )
+            yield state
+            if state.session is not None:
+                # A failure here is explained by end_isolation when it matters.
+                with contextlib.suppress(DBAPIError):
+                    state.session.close()
+            breach = end_isolation(
+                isolation, nodeid=request.node.nodeid, fixture=state.fixture or "sqla_connection"
+            )
+        finally:
+            isolation.unwatch()
     if breach is not None:
         raise breach
 
@@ -330,6 +345,7 @@ async def _sqla_async_transaction_anyio(
         sqla_session_options,
         nodeid=request.node.nodeid,
         scope=None,
+        timeout=_settings(request).lock_timeout,
     ) as state:
         yield state
 
@@ -353,10 +369,11 @@ globals().update(_asyncio.pytest_asyncio_fixtures(_optional_import("pytest_async
 def sqla_connection(request: pytest.FixtureRequest) -> Connection:
     """A connection inside this test's transaction; everything on it is rolled back.
 
-    One per test, from a session-wide engine, after ``BEGIN`` and a guard
-    SAVEPOINT. At teardown pytest-sqla rolls back and checks that nothing
-    escaped: a commit of the connection itself, or the database ending the
-    transaction on its own (MySQL DDL), fails this test with IsolationError.
+    One per test, a DBAPI connection of its own from a session-wide NullPool
+    engine, after ``BEGIN`` and a guard SAVEPOINT. At teardown pytest-sqla
+    rolls back and checks that nothing escaped: a commit of the connection
+    itself or of a second connection from its engine, or the database ending
+    the transaction on its own (MySQL DDL), fails this test with IsolationError.
     """
     return _sync_state(request, "sqla_connection").connection
 
@@ -393,7 +410,8 @@ def sqla_async_connection(request: pytest.FixtureRequest) -> AsyncConnection:
 
     Works under every pytest-asyncio loop scope, in strict and auto mode, and
     under anyio. Using it from another event loop raises LoopMismatchError
-    before the driver sees the statement.
+    before the driver sees the statement, COMMIT or ROLLBACK. Every task that
+    uses it must be done before the test ends.
     """
     return _async_state(request, "sqla_async_connection").connection
 
@@ -489,5 +507,5 @@ def _async_state(request: pytest.FixtureRequest, fixture: str) -> AsyncState:
         )
     request.getfixturevalue("sqla_schema")
     state: AsyncState = request.getfixturevalue(internal)
-    state.claim(fixture)
+    state.claim(fixture, anyio_backend=_asyncio.anyio_backend_in_asyncio_test(request))
     return state

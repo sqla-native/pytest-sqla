@@ -27,7 +27,15 @@ from tests.helpers import table_names
 REQUIRE_ALL = os.environ.get("SQLA_TEST_REQUIRE_ALL") == "1"
 
 # Every table an inner run may leave behind when a test breaks it on purpose.
-TABLES = ("zz_broken", "note", "user_account", "pytest_sqla", "it_extra", "recipe_item")
+TABLES = (
+    "zz_broken",
+    "note",
+    "user_account",
+    "pytest_sqla",
+    "it_extra",
+    "recipe_item",
+    "alembic_version",
+)
 
 
 @dataclass(frozen=True)
@@ -133,6 +141,11 @@ def postgresql_database(request: pytest.FixtureRequest) -> Iterator[Database]:
 
 @pytest.fixture(params=_params(sync=True, family="mysql"))
 def mysql_database(request: pytest.FixtureRequest) -> Iterator[Database]:
+    yield from _database(request)
+
+
+@pytest.fixture(params=_params(sync=False, family="mysql"))
+def async_mysql_database(request: pytest.FixtureRequest) -> Iterator[Database]:
     yield from _database(request)
 
 

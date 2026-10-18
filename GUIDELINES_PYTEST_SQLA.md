@@ -32,14 +32,37 @@ isolation fails, at its own teardown, saying why.
   the transaction on its own, and it makes even an application's own
   `Session(bind=connection)` with the default mode create a savepoint.
 
-- **Only the guard decides a breach, and only a root commit is one.** The
+- **Only the guard decides a breach, and only a commit is one.** The
   teardown rolls back every savepoint inside the guard, innermost first, then
   the guard. An inner savepoint that is already gone is not a breach (closing
   sessions out of order discards the later ones), a disconnect is not one (the
   server rolled back), and a root `rollback()` is not one (nothing escaped).
-  Never call `rollback()` on a nested transaction that is not the current one:
-  SQLAlchemy warns "nested transaction already deassociated", and that warning
-  is an error in every suite that uses `filterwarnings = error`.
+  A root commit is one, and so is a commit on any other connection of
+  pytest-sqla's own engine during the test, which an engine-level listener,
+  removed at teardown, sees. Never call `rollback()` on a nested transaction
+  that is not the current one: SQLAlchemy warns "nested transaction already
+  deassociated", and that warning is an error in every suite that uses
+  `filterwarnings = error`.
+
+- **A MySQL deadlock is not a breach; repair it, do not report it.** InnoDB
+  rolls the victim's whole transaction back, savepoints included, so the guard
+  is gone without anything committed. Measured on MySQL 8.4 before the repair:
+  the application saw "(1305, 'SAVEPOINT sa_savepoint_2 does not exist')"
+  instead of the 1213, a session's `rollback()` raised it too, and every
+  victim got a false I2. A `handle_error` listener records the 1213, and the
+  next savepoint event re-creates the savepoints SQLAlchemy holds, guard first,
+  read from `NestedTransaction._savepoint` and `_previous_nested` (the
+  `savepoint` event fires before SQLAlchemy names the savepoint). Never
+  re-create them on a lock wait timeout: with the default
+  `innodb_rollback_on_timeout = OFF` the savepoints survive, and re-creating
+  one moves it.
+
+- **A breach discards the connection.** `end_isolation` invalidates the
+  connection of any IsolationError, so what broke it (the measured case is
+  MySQL's `SET autocommit = 1`) cannot reach the next test through a pool. A
+  root that ended without our rollback (the test's own, or a commit the loop
+  guard stopped) is released with `connection.rollback()`: SQLAlchemy keeps
+  the inactive root otherwise, and closing then skips the pool's reset.
 
 - **SQLite gets SQLAlchemy's documented fix on every engine.** In sqlite3's
   legacy transaction control (Python's default through 3.15) a SAVEPOINT
@@ -54,8 +77,9 @@ isolation fails, at its own teardown, saying why.
 
   `tests/sync/test_sqlite.py` keeps the unfixed case as a control, so the
   plugin's own tests prove something. With `autocommit=False` the plugin adds
-  no listeners (a second `BEGIN` would fail), and the legacy check follows the
-  runtime default, so the fix switches itself off when Python flips it.
+  no savepoint fix (a second `BEGIN` would fail), and the legacy check follows
+  the runtime default, so the fix switches itself off when Python flips it.
+  The write lock at BEGIN is separate and stays on: see Files.
 
 - **Shared in-memory SQLite is memdb, never shared cache.** One memdb name per
   session, shared by the sync engine, the async engines and the schema
@@ -63,11 +87,15 @@ isolation fails, at its own teardown, saying why.
   "discouraged" (sqlite.org), and measured, it fails at once where memdb waits
   out the busy timeout like a file.
 
-- **Files begin IMMEDIATE.** A deferred transaction that has read and then
-  writes while another process holds the write lock gets "database is locked"
-  at once, because SQLite refuses the lock upgrade rather than deadlock
-  (measured: two xdist workers sharing a file in none mode). An immediate one
-  waits.
+- **Files begin IMMEDIATE, in either transaction control.** A deferred
+  transaction that has read and then writes while another process holds the
+  write lock gets "database is locked" at once, because SQLite refuses the
+  lock upgrade rather than deadlock (measured: two xdist workers sharing a file
+  in none mode, legacy and PEP 249 mode alike). An immediate one waits. PEP 249
+  mode always keeps a deferred transaction open, so there the begin listener
+  rolls it back and begins an immediate one, on the DBAPI cursor: through
+  SQLAlchemy, a lock timeout's automatic rollback first failed with "cannot
+  rollback - no transaction is active".
 
 - **Every async object lives on the test's own event loop.** pytest-asyncio
   picks a fixture's loop and a test's loop independently, and nothing compares
@@ -84,20 +112,43 @@ isolation fails, at its own teardown, saying why.
   So the public async fixtures are **sync dispatchers**: each reads the test
   item and requests an internal fixture declared with
   `pytest_asyncio.fixture(loop_scope=S)` for the test's scope, or a plain async
-  fixture that anyio runs in the test's runner. A loop guard on every
+  fixture that anyio runs in the test's runner. `is_async_test()` decides
+  first: pytest-asyncio runs such a test even with `anyio_backend` among its
+  fixtures, and only an `anyio` marker makes it anyio's. Which plugin then runs
+  its async fixtures depends on registration order (measured with `-p anyio`
+  and `-p asyncio`), so the loop guard names that cause. A loop guard on every
   connection raises `LoopMismatchError` before the driver sees a cross-loop
-  statement, for every driver alike. Never call `getfixturevalue()` on an async
-  fixture from inside a running async fixture ("Runner.run() cannot be called
-  from a running event loop").
+  statement, COMMIT or ROLLBACK, for every driver alike; it listens on
+  `before_execute` too, which comes before the cursor that aiosqlite, psycopg,
+  aiomysql and asyncmy await to create. Never call `getfixturevalue()` on an
+  async fixture from inside a running async fixture ("Runner.run() cannot be
+  called from a running event loop").
+
+- **No teardown next to a task the test left running.** SQLAlchemy's asyncio
+  connector does not serialise commit and rollback with statements, so a task
+  still using the connection races the rollback. Measured: asyncmy hung
+  forever, asyncpg and aiomysql raised protocol errors, psycopg warned. The
+  guard records every task that used the connection; if one is still pending,
+  the connection is invalidated (the server rolls back) and the test fails.
+  The teardown is bounded by `sqla_lock_timeout` with `asyncio.wait_for`.
 
 - **An engine shared across loops is NullPool; a pool lives exactly as long as
   its loop.** Per-test loops and anyio share one NullPool engine, as
   SQLAlchemy's asyncio docs recommend for several loops. Class, module, package
   and session loops get an engine of that scope, disposed on that loop before
   pytest-asyncio closes it. Measured cost of NullPool per test
-  (`scripts/benchmark.py`, localhost Docker): asyncpg 1.54 → 7.02 ms, psycopg
-  async 1.54 → 5.47 ms, aiomysql 1.94 → 3.10 ms, asyncmy 1.87 → 3.09 ms.
+  (`scripts/benchmark.py`, localhost Docker): asyncpg 1.56 → 6.95 ms, psycopg
+  async 1.57 → 5.15 ms, aiomysql 1.97 → 3.12 ms, asyncmy 1.98 → 3.18 ms.
   Re-run the benchmark before quoting a number.
+
+- **The sync engine is NullPool too.** ROLLBACK does not undo session state,
+  and a pooled connection handed it to the next test: measured, MySQL's `SET
+  FOREIGN_KEY_CHECKS = 0` let the next test's foreign-key violation pass,
+  PostgreSQL kept a session advisory lock, and SQLite's `PRAGMA query_only = 1`
+  failed every later test. That costs psycopg 1.33 → 5.43 ms and pymysql
+  1.24 → 6.54 ms per test. A `poolclass` in `sqla_engine_options`, and a wider
+  loop scope, are the user's explicit trade; NullPool engines leave out the
+  pool-sizing options create_engine() would refuse for them.
 
 - **`sqlalchemy.ext.asyncio` is imported inside function bodies only.** On
   SQLAlchemy 2.1 without greenlet the import itself raises. A sync-only
@@ -112,7 +163,9 @@ isolation fails, at its own teardown, saying why.
 - **No monkeypatching** of SQLAlchemy, pytest-asyncio, anyio or the
   application. The plugin this replaces in many projects,
   pytest-flask-sqlalchemy, patched session methods; that is how such plugins
-  rot.
+  rot. Reading is not patching, but keep it rare and pinned: the deadlock
+  repair's two private attributes are the only ones, and the MySQL suite fails
+  if they move.
 
 ### 2. Never destroy what you did not create, and never hang
 
@@ -126,11 +179,13 @@ isolation fails, at its own teardown, saying why.
   `create_all` per worker with `-n 4` ended "2 passed, 6 errors" on 3 of 3 runs
   per backend. PostgreSQL uses `pg_advisory_xact_lock`, MySQL `GET_LOCK`,
   SQLite `BEGIN IMMEDIATE`; any other dialect refuses xdist (F15).
-- **Every wait is bounded.** `sqla_lock_timeout` bounds the schema lock and
-  the DDL lock waits. Measured: a drop behind a leaked transaction failed after
-  2.0 s with sqlstate 55P03 and MySQL 1205, and without a timeout it blocked
-  forever. A timeout becomes SchemaConflictError with the cause named, never a
-  hang.
+- **Every wait is bounded.** `sqla_lock_timeout` bounds the schema lock, the
+  DDL lock waits of creation and drop alike, and an async test's teardown.
+  Measured: a drop behind a leaked transaction failed after 2.0 s with
+  sqlstate 55P03 and MySQL 1205, and without a timeout it blocked forever;
+  `--sqla-recreate-schema` behind a live run failed with the same raw errors
+  until creation got its own explanation. A timeout becomes SchemaConflictError
+  with the cause named, never a hang.
 - **A database pytest-sqla made up is discarded, not dropped.** On Python 3.11+
   an unread result keeps its SQLite read lock until it is garbage-collected,
   even after rollback and close, and pytest keeps the last failure's
@@ -148,8 +203,8 @@ isolation fails, at its own teardown, saying why.
   this plugin is a crash in their suite. Every problem is an error with a
   message that says what to do.
 - **No false alarms.** A root rollback, an inner savepoint lost to untidy
-  session handling, and a disconnect are not breaches. A false IsolationError
-  would teach people to ignore the real ones.
+  session handling, a disconnect and a MySQL deadlock are not breaches. A
+  false IsolationError would teach people to ignore the real ones.
 - **The test's own failure always wins.** Teardown errors are separate
   entries; they never replace the test body's exception.
 - **Messages carry no internal traceback.** Plugin frames are hidden
@@ -191,6 +246,15 @@ isolation fails, at its own teardown, saying why.
   that was meant for PostgreSQL is the failure this rule exists for.
 - **Settings are checked at configure time when that is cheap**, and lazily at
   first database use otherwise (metadata imports, engines, connections).
+- **Check an option the way its consumer reads it.** SQLAlchemy reads an
+  isolation level as `level.replace("_", " ").upper()`, pymysql reads any
+  `autocommit` string in a URL as true, and pytest 9's native TOML hands a
+  number to a typed ini option only: a refusal or a parse that is stricter or
+  looser than the consumer is a bypass or a crash. Measured: lowercase
+  `"autocommit"` committed every MySQL test for real.
+- **`sqlite3` is imported inside function bodies**, like
+  `sqlalchemy.ext.asyncio`: a Python built without it must still load the
+  plugin for a suite that never uses SQLite.
 - **Errors name the fixture the test asked for**, which is why the public
   fixtures dispatch to internal ones after checking.
 
@@ -263,14 +327,20 @@ green CI without ceremony.
 ### 10. Releasing
 
 Bump `version` in `pyproject.toml` **and** `__version__` in
-`src/pytest_sqla/__init__.py` to the same value, date the CHANGELOG entry,
-then tag `vX.Y.Z` and push the tag. `.github/workflows/release.yml` checks the
-tag against both, runs every gate against real servers, builds, smoke-tests
-the wheel in a clean virtualenv, audits the closure, and publishes to PyPI
-through **Trusted Publishing** (OIDC, environment `pypi`, PEP 740
-attestations; no token, no secret). Then cold-verify from PyPI in a fresh
-virtualenv (`uv pip install --refresh`), checking the version through the
-Simple API, because the legacy JSON endpoint lags behind new releases.
+`src/pytest_sqla/__init__.py` to the same value, date the CHANGELOG entry with
+the day you push the tag, then tag `vX.Y.Z` and push the tag.
+`.github/workflows/release.yml` checks the tag against both, runs every gate
+against real servers, builds, smoke-tests the wheel in a clean virtualenv,
+audits the closure, and publishes to PyPI through **Trusted Publishing** (OIDC,
+environment `pypi`, PEP 740 attestations; no token, no secret). Then
+cold-verify from PyPI in a fresh virtualenv (`uv pip install --refresh`),
+checking the version through the Simple API, because the legacy JSON endpoint
+lags behind new releases.
+
+Before the first release only: register a *pending* Trusted Publisher on PyPI
+(owner `sqla-native`, repository `pytest-sqla`, workflow `release.yml`,
+environment `pypi`), because the project does not exist there yet. Without it
+the publish step fails after every gate has passed.
 
 ### 11. Mutation testing: local only
 

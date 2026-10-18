@@ -311,3 +311,159 @@ def test_postgresql_psycopg_serves_both_families() -> None:
     url = make_url("postgresql+psycopg://ada@localhost/app")
     assert not url.get_dialect().is_async
     assert url.get_dialect().get_async_dialect_cls(url).is_async
+
+
+def test_a_commit_on_a_second_connection_of_the_engine_is_reported(project: Project) -> None:
+    project.models()
+    project.ini(sqla_url="sqlite+aiosqlite://")
+    project.tests(
+        """
+        import pytest
+        from sqlalchemy import text
+        from models import acount
+
+        @pytest.mark.asyncio
+        async def test_escapes(sqla_async_connection):
+            async with sqla_async_connection.engine.begin() as other:
+                await other.execute(text("INSERT INTO user_account (email) VALUES ('audit')"))
+
+        @pytest.mark.asyncio
+        async def test_later(sqla_async_session):
+            assert await acount(sqla_async_session) == 1, "the leak is real"
+        """
+    )
+    result = project.run()
+    result.assert_outcomes(passed=2, errors=1)
+    result.stdout.fnmatch_lines(
+        [
+            "E *pytest_sqla.IsolationError: pytest-sqla: test_inner.py::test_escapes committed on "
+            "a second connection of the engine behind sqla_async_connection*"
+        ]
+    )
+
+
+# ------------------------------------------------- tasks the test leaves running
+
+LEFT_RUNNING = (
+    "E *pytest_sqla.IsolationError: pytest-sqla: test_inner.py::test_fire_and_forget left 1 "
+    "task(s) running that use its connection: test_fire_and_forget.<locals>.audit. A "
+    "connection serves one operation at a time, so instead of rolling the test transaction "
+    "back next to them, pytest-sqla closed the connection, and the database rolled the test's "
+    "work back. Await or cancel such tasks before the test ends."
+)
+
+
+@pytest.mark.parametrize("marker", ["asyncio", "anyio"])
+def test_a_task_left_running_is_reported_and_its_work_rolled_back(
+    project: Project, database: Path, marker: str
+) -> None:
+    """Measured on servers: asyncmy hung the run forever, the others failed oddly."""
+    project.conftest(ANYIO_BACKEND)
+    project.tests(
+        f"""
+        import asyncio
+        import pytest
+        from models import User, acount
+
+        pytestmark = pytest.mark.{marker}
+
+        async def test_fire_and_forget(sqla_async_sessionmaker):
+            async def audit():
+                async with sqla_async_sessionmaker() as session:
+                    session.add(User(email="audit@example.com"))
+                    await session.commit()
+
+            asyncio.create_task(audit())  # the code under test never awaits it
+
+        async def test_next(sqla_async_session):
+            assert await acount(sqla_async_session) == 0
+        """
+    )
+    result = project.run()
+    result.assert_outcomes(passed=2, errors=1)
+    result.stdout.fnmatch_lines([LEFT_RUNNING])
+    assert users(database) == []
+
+
+def test_a_teardown_that_does_not_finish_is_cut_short(project: Project, database: Path) -> None:
+    project.ini(sqla_lock_timeout="0.2")
+    project.conftest(
+        """
+        import asyncio
+        import pytest
+        from sqlalchemy.ext.asyncio import AsyncSession
+
+        class HangingClose(AsyncSession):
+            async def close(self):
+                await asyncio.sleep(30)
+
+        @pytest.fixture(scope="session")
+        def sqla_session_options():
+            return {"class_": HangingClose}
+        """
+    )
+    project.tests(
+        """
+        import pytest
+        from sqlalchemy import text
+        from models import User
+
+        @pytest.mark.asyncio
+        async def test_hangs(sqla_async_session):
+            sqla_async_session.add(User(email="ada@example.com"))
+            await sqla_async_session.flush()
+
+        @pytest.mark.asyncio
+        async def test_next(sqla_async_connection):
+            count = text("SELECT count(*) FROM user_account")
+            assert await sqla_async_connection.scalar(count) == 0
+        """
+    )
+    result = project.run()
+    result.assert_outcomes(passed=2, errors=1)
+    result.stdout.fnmatch_lines(
+        [
+            "E *pytest_sqla.IsolationError: pytest-sqla: rolling back test_inner.py::test_hangs's "
+            "transaction took longer than sqla_lock_timeout (0.2 s), so pytest-sqla closed the "
+            "connection instead, and the database rolled the test's work back. Usually a task "
+            "the test left running uses the connection at the same time; await or cancel such "
+            "tasks before the test ends."
+        ]
+    )
+    assert users(database) == []
+
+
+def test_a_query_cancelled_in_a_test_does_not_lock_the_next_one(project: Project) -> None:
+    """Measured: the next test failed at setup with "database is locked" after the 5 s
+    busy timeout.
+
+    A subprocess: whether the cancelled statement is collected in time depends on the
+    garbage collector, which the outer test session keeps busy.
+    """
+    project.models()
+    project.ini(sqla_url=f"sqlite+aiosqlite:///{project.path / 'test.db'}")
+    project.tests(
+        """
+        import asyncio
+        import pytest
+        from sqlalchemy import text
+        from models import User, acount
+
+        SLOW = (
+            "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 30000000) "
+            "SELECT count(*) FROM c"
+        )
+
+        @pytest.mark.asyncio
+        async def test_times_out(sqla_async_session):
+            sqla_async_session.add(User(email="ada@example.com"))
+            await sqla_async_session.commit()
+            with pytest.raises(asyncio.TimeoutError):
+                await asyncio.wait_for(sqla_async_session.execute(text(SLOW)), 0.2)
+
+        @pytest.mark.asyncio
+        async def test_next(sqla_async_session):
+            assert await acount(sqla_async_session) == 0
+        """
+    )
+    project.run_subprocess(timeout=60).assert_outcomes(passed=2)

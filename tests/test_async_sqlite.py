@@ -142,11 +142,42 @@ def test_an_async_engine_refuses_a_pool(project: Project, key: str, scope: str) 
     result.assert_outcomes(errors=1)
     result.stdout.fnmatch_lines(
         [
-            "*pytest-sqla: sqla_engine_options cannot set poolclass for async engines; "
+            "*pytest-sqla: sqla_engine_options cannot set poolclass or pool for async engines; "
             "pytest-sqla picks the pool per event loop (NullPool for a per-test loop, a pool that "
             "lives as long as the loop otherwise)."
         ]
     )
+
+
+@pytest.mark.parametrize("scope", ["function", "module"])
+def test_queue_pool_options_reach_only_the_pooled_async_engines(
+    project: Project, scope: str
+) -> None:
+    """A per-test loop's engine is NullPool, which create_engine() refuses them for."""
+    project.models()
+    project.ini(sqla_url="sqlite+aiosqlite://")
+    project.conftest(
+        """
+        import pytest
+
+        @pytest.fixture(scope="session")
+        def sqla_engine_options():
+            return {"pool_size": 3, "max_overflow": 0, "pool_timeout": 3, "pool_use_lifo": True}
+        """
+    )
+    project.tests(
+        f"""
+        import pytest
+        from sqlalchemy.pool import AsyncAdaptedQueuePool
+
+        @pytest.mark.asyncio(loop_scope="{scope}")
+        async def test_db(sqla_async_connection):
+            pool = sqla_async_connection.engine.sync_engine.pool
+            if isinstance(pool, AsyncAdaptedQueuePool):
+                assert pool.size() == 3
+        """
+    )
+    project.run().assert_outcomes(passed=1)
 
 
 def test_async_session_options_reach_the_sessions(project: Project) -> None:

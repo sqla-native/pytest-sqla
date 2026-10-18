@@ -111,9 +111,9 @@ def test_another_runs_schema_is_refused(project: Project, database: str) -> None
         [
             f"E *pytest_sqla.SchemaConflictError: pytest-sqla: the database at {database} holds "
             "the schema of another pytest-sqla run (started 2026-10-18T09:00:00+00:00 by "
-            "ci-host:4242/gw1; 2 worker(s) never finished). If no other test run uses this "
-            "database, run again with --sqla-recreate-schema; otherwise give this run a "
-            "database of its own.",
+            "ci-host:4242/gw1; 2 worker(s) still running, or crashed). If no other test run "
+            "uses this database, run again with --sqla-recreate-schema; otherwise give this run "
+            "a database of its own.",
         ]
     )
     assert table_names(database) == ["note", "pytest_sqla", "user_account"]
@@ -149,7 +149,7 @@ def test_an_empty_marker_table_is_still_another_runs(project: Project, database:
     result = project.run()
     result.assert_outcomes(errors=1)
     result.stdout.fnmatch_lines(
-        ["*(started at an unknown time by an unknown run; 0 worker(s) never finished)*"]
+        ["*(started at an unknown time by an unknown run; 0 worker(s) still running, or crashed)*"]
     )
 
 

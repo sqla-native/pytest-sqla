@@ -47,7 +47,8 @@ parts right on its own, each one measured:
    did not create.
 6. **Breaches fail loudly, in the test that caused them.** A commit of the
    connection itself, or MySQL committing DDL on its own, fails that test's
-   teardown instead of leaking rows into later tests.
+   teardown, so the leak is reported where it happened instead of surfacing
+   as a mystery in some later test.
 
 ## Install
 
@@ -176,7 +177,8 @@ to your own sessionmaker: with the default `expire_on_commit=True`, reading
 asyncio extension refuses with MissingGreenlet.
 
 This example runs in CI on SQLite, PostgreSQL and MySQL, under pytest-asyncio
-and under anyio: see [`examples/`](examples/).
+and under anyio: see
+[`examples/`](https://github.com/sqla-native/pytest-sqla/tree/main/examples).
 
 ## Fixtures
 
@@ -209,7 +211,7 @@ see each other's writes, and asking for both is an error.
 | Async URL | `--sqla-async-url` | `PYTEST_SQLA_ASYNC_URL` | `sqla_async_url` | the database URL |
 | Metadata | | | `sqla_metadata = "app.models:Base"` | none |
 | Schema mode | | | `sqla_schema = create` or `none` | `create` |
-| Lock and DDL timeout, seconds | | | `sqla_lock_timeout` | `30` |
+| Lock, DDL and teardown timeout, seconds | | | `sqla_lock_timeout` | `30` |
 | Replace a crashed run's schema | `--sqla-recreate-schema` | | | off |
 
 The command line beats the environment, which beats the ini file: the ini value
@@ -231,16 +233,34 @@ replaces the computed value, as with any pytest fixture.
 - **Inert unless asked.** A run whose tests never request an `sqla_*` fixture
   imports no application code, opens no connection, and never imports
   `sqlalchemy.ext.asyncio`.
-- **The report header says which database a run used:**
+- **The report header says which database the run is configured for:**
   `sqla: url=postgresql+psycopg://app:***@localhost/app_test (from PYTEST_SQLA_URL), schema=create`.
+  It shows the configuration, read before any test runs, so an override of
+  the `sqla_url` fixture, such as a container's URL, is not in it; the URL a
+  test connects to is `sqla_connection.engine.url`.
 
 `sqla_engine_options` reaches every engine pytest-sqla creates: `echo`,
 `connect_args`, `json_serializer`, `execution_options` and so on. It refuses
-what would make a rollback impossible (`isolation_level="AUTOCOMMIT"`,
-sqlite3's `autocommit=True`) and, for async engines, `poolclass`, which
-pytest-sqla picks per event loop. The same options reach the sync and the async
-engines, so keep driver-specific `connect_args` to a URL whose driver serves
-both.
+what would make a rollback impossible: `isolation_level="AUTOCOMMIT"` in any
+spelling SQLAlchemy accepts, `autocommit=True` in `connect_args` for any driver,
+and an `autocommit` query parameter in a server URL, which pymysql reads as
+true even when it says `false`. It refuses
+`isolation_level="READ UNCOMMITTED"`, which lets a test read another xdist
+worker's uncommitted rows, and, for async engines, `poolclass` and `pool`,
+which pytest-sqla picks per event loop. The same options reach the sync and the
+async engines, so keep driver-specific `connect_args` to a URL whose driver
+serves both.
+
+Each test gets a DBAPI connection of its own: the sync engine is NullPool,
+because ROLLBACK undoes rows but not a connection's session state, and a
+pooled connection hands that state to the next test (measured: MySQL's `SET
+FOREIGN_KEY_CHECKS = 0`, temporary tables and `sql_mode`, PostgreSQL's
+session advisory locks and PREPAREd statements, SQLite's `PRAGMA
+query_only`). Give `sqla_engine_options` a `poolclass` to pool the sync
+engine anyway, and accept that state then carries over; the async engines of
+wider loop scopes are pooled the same way (see Pooling). `pool_size`,
+`max_overflow`, `pool_timeout` and `pool_use_lifo` reach only pooled engines;
+the others leave them out.
 
 `sqla_session_options` reaches the sessionmakers, so the test sessions can
 behave like the application's: `expire_on_commit`, `autoflush`, `info`, or
@@ -267,13 +287,16 @@ keep three promises:
   exists without the marker, every database test fails with
   SchemaConflictError naming the tables, and nothing is touched. Point
   `sqla_url` at a database used only for tests.
-- **It notices a crashed run.** A run killed before its teardown leaves the
-  marker behind. The next run refuses that schema, says when and where the
-  other run started, and suggests `--sqla-recreate-schema`, which drops and
-  recreates it.
-- **It never hangs.** Creation and drop wait at most `sqla_lock_timeout`
-  seconds for a lock. A test that leaked a transaction on a table makes the
-  drop fail with a message saying so, instead of blocking the run forever.
+- **It notices a crashed run, or one still going.** A run killed before its
+  teardown leaves the marker behind, and so does a run that is still running.
+  The next run refuses that schema, says when and where the other run
+  started, and suggests `--sqla-recreate-schema`, which drops and recreates
+  it.
+- **It never hangs** on PostgreSQL, MySQL, MariaDB and SQLite. Creation and
+  drop wait at most `sqla_lock_timeout` seconds for a lock. A test that leaked
+  a transaction on a table makes the drop fail with a message saying so, and
+  recreating the schema of a run that is still going fails the same way,
+  instead of blocking the run forever.
 
 On MySQL, where DDL commits on its own, a creation that fails half way drops the
 tables it had already created. A SQLite database pytest-sqla made up, an
@@ -289,24 +312,35 @@ a file or server database: an in-memory SQLite database exists only inside
 pytest-sqla's own connections.
 
 ```python
+import alembic.command
+import alembic.config
+import pytest
+from sqlalchemy import make_url
+
+
 @pytest.fixture(scope="session")
 def sqla_schema(sqla_url):
     config = alembic.config.Config("alembic.ini")
-    config.set_main_option("sqlalchemy.url", sqla_url.render_as_string(hide_password=False))
+    # sqla_url may be a str or a URL. Alembic's config reads % as interpolation,
+    # and a rendered URL percent-encodes its password, so every % is doubled.
+    url = make_url(sqla_url).render_as_string(hide_password=False)
+    config.set_main_option("sqlalchemy.url", url.replace("%", "%%"))
     alembic.command.upgrade(config, "head")
     yield
     alembic.command.downgrade(config, "base")
 ```
 
-Under pytest-xdist such an override runs once per worker, so it has to
-serialise itself.
+The suite runs this block as written, against SQLite and against PostgreSQL
+with a password that needs escaping. Under pytest-xdist such an override runs
+once per worker, so it has to serialise itself.
 
 ## Async details
 
 - **pytest-asyncio, strict or auto mode.** In strict mode, mark async tests
   with `@pytest.mark.asyncio`; pytest-sqla's async fixtures need no marking,
   because they are plain sync fixtures that hand you objects opened on the
-  right loop.
+  right loop. A plain `def` test cannot use them, even through an async
+  fixture: there is no test loop to open the connection on.
 - **Every loop scope.** `@pytest.mark.asyncio(loop_scope="module")`, the
   `asyncio_default_test_loop_scope` ini key, class, package and session loops
   all work: pytest-sqla reads the test's loop scope and opens its connection on
@@ -315,38 +349,66 @@ serialise itself.
   installed, with pytest-asyncio in strict mode. In auto mode pytest-asyncio
   would run an anyio test's async fixtures on its own loop, so pytest-sqla
   refuses that combination with an explanation. SQLAlchemy's asyncio extension
-  runs only on asyncio, so the trio backend is refused too.
+  runs only on asyncio, so the trio backend is refused too. A pytest-asyncio
+  test that has `anyio_backend` among its fixtures, typically through a helper
+  fixture written for anyio tests, is still a pytest-asyncio test. Whether
+  anyio then runs its async fixtures, pytest-sqla's included, on a loop of its
+  own depends on which of the two plugins registered first; when it does, the
+  loop guard says so. Keep `anyio_backend` out of such tests.
 - **The loop guard.** Using a test's connection from another event loop raises
-  `LoopMismatchError` before the driver sees the statement, and the connection
-  stays usable. Measured without the guard: asyncpg, aiomysql and asyncmy fail
-  with "attached to a different loop", and asyncpg's connection is unusable
-  afterwards; psycopg happens to survive, so the guard treats every driver
-  alike. The two
-  usual causes are an async fixture on a different loop scope than the test
-  (give it the test's loop scope), and application code that runs in its own
-  thread with its own loop, such as Starlette's TestClient (use
-  `httpx.AsyncClient` with `ASGITransport`).
+  `LoopMismatchError` before the driver sees the statement, a COMMIT or a
+  ROLLBACK, and the connection stays usable. Measured without the guard:
+  asyncpg, aiomysql and asyncmy fail with "attached to a different loop", and
+  asyncpg's connection is unusable afterwards; psycopg happens to survive, so
+  the guard treats every driver alike. The two usual causes are an async
+  fixture on a different loop scope than the test (give it the test's loop
+  scope), and application code that runs in its own thread with its own loop,
+  such as Starlette's TestClient (use `httpx.AsyncClient` with
+  `ASGITransport`).
+- **Tasks the test leaves running.** A connection serves one operation at a
+  time, and a task the test started and never awaited races the teardown on
+  it. Measured: asyncmy hung the run forever, and the other drivers failed the
+  teardown with their own errors. pytest-sqla notices a task that used the
+  connection and is still running, closes the connection instead of rolling
+  it back next to that task (the database then rolls the test back), and fails
+  the test with IsolationError naming it. The teardown as a whole is bounded
+  by `sqla_lock_timeout` the same way. Await or cancel such tasks before the
+  test ends.
 - **Pooling.** For a per-test loop, the pytest-asyncio default, and for anyio,
   the async engine is NullPool, which SQLAlchemy's asyncio docs recommend when
   one engine serves several event loops. For a class, module, package or
   session loop, the engine has a real pool that lives exactly as long as that
-  loop. The sync engine is always a normal pool.
+  loop, and the tests on that loop share its connections: session state one of
+  them sets, such as `SET FOREIGN_KEY_CHECKS = 0` or a session advisory lock,
+  reaches the next. A connection whose transaction broke (an IsolationError) is
+  discarded rather than handed on. The sync engine is NullPool too, unless you
+  give it a `poolclass`.
 
-What NullPool costs, measured with [`scripts/benchmark.py`](scripts/benchmark.py)
+What NullPool costs, measured with
+[`scripts/benchmark.py`](https://github.com/sqla-native/pytest-sqla/blob/main/scripts/benchmark.py)
 on localhost Docker (milliseconds per test, best of 5 runs of 200 isolation
 cycles; re-measure on your own machine before relying on them):
 
 | Driver | Pooled | NullPool |
 | --- | ---: | ---: |
-| asyncpg | 1.54 | 7.02 |
-| psycopg async | 1.54 | 5.47 |
-| aiomysql | 1.94 | 3.10 |
-| asyncmy | 1.87 | 3.09 |
-| psycopg (sync, for reference) | 1.31 | 4.88 |
-| pymysql (sync, for reference) | 1.29 | 6.39 |
+| asyncpg | 1.56 | 6.95 |
+| psycopg async | 1.57 | 5.15 |
+| aiomysql | 1.97 | 3.12 |
+| asyncmy | 1.98 | 3.18 |
+| psycopg (sync) | 1.33 | 5.43 |
+| pymysql (sync) | 1.24 | 6.54 |
 
-If those milliseconds matter, give the database tests a wider loop scope, for
-example `asyncio_default_test_loop_scope = module`.
+If those milliseconds matter more than session state, give the async database
+tests a wider loop scope, together with their fixtures':
+
+```ini
+asyncio_default_test_loop_scope = module
+asyncio_default_fixture_loop_scope = module
+```
+
+An async fixture left on the per-test loop while its tests run on the module
+loop uses their connection from another loop, and the loop guard stops it.
+For sync tests, `sqla_engine_options` with a `poolclass` is the same trade.
 
 pytest-asyncio 1.2 is the floor: on 1.0 and 1.1, a test with a session loop
 that ran after tests with a module loop was measured running on a different
@@ -357,56 +419,86 @@ loop than its own scope's fixtures.
 - **The savepoint fix.** pytest-sqla installs SQLAlchemy's documented connect
   and begin listeners on every SQLite engine it creates, sync and async. With
   `connect_args={"autocommit": False}` (Python 3.12+, PEP 249 mode) sqlite3
-  handles transactions correctly by itself, and pytest-sqla adds nothing. When
-  a future Python makes that the default, the fix switches itself off.
+  handles transactions correctly by itself, and pytest-sqla adds only the write
+  lock below. When a future Python makes that the default, the fix switches
+  itself off.
 - **In-memory databases** (`sqlite://`, `sqlite:///:memory:`,
   `sqlite+aiosqlite://`) become one named database on SQLite's memdb VFS for
   the whole session, held open by a keeper connection, and shared between the
   sync and async engines. That needs SQLite 3.36 (2021) or newer.
   Shared-cache mode is not used: SQLite calls it obsolete, and it fails at
   once where memdb waits for a lock like a file does. A shared-memory URL of
-  your own (`mode=memory`, `vfs=memdb`) is used as given.
-- **Files.** A test's transaction on a SQLite file begins `IMMEDIATE`, so
-  another process waits for it instead of failing with "database is locked".
-  Under pytest-xdist in create mode, each worker gets its own copy next to the
-  configured file, `test-gw0.db`, which pytest-sqla deletes afterwards; it
-  never deletes a file you named. In none mode the workers share the file and
-  take turns.
+  your own (`mode=memory`, `vfs=memdb`) is used as given, plus
+  `check_same_thread=False` on pysqlite, so a test can use it from a thread.
+- **Files.** A test's transaction on a SQLite file begins `IMMEDIATE`, in PEP
+  249 mode too, so another process waits for it instead of failing with
+  "database is locked". Under pytest-xdist in create mode, each worker gets a
+  file of its own next to the configured one, `test-gw0.db`, which pytest-sqla
+  deletes afterwards; it never deletes a file you named. A `file:` URI URL
+  (`uri=true`) is not split per worker.
+- **One file, several workers.** In none mode the workers share the file, and
+  since every test holds the write lock until its teardown, read-only tests
+  included, they run one at a time: no parallelism. A worker waits for the lock
+  at most sqlite3's busy timeout, 5 seconds by default, so set
+  `connect_args={"timeout": ...}` above (workers - 1) times your longest test,
+  or give each worker its own file with `sqla_schema = create`.
 - **A raw `COMMIT` or sqlite3's `executescript()`** inside a test ends the
   transaction, and the test fails at teardown with IsolationError.
 - **An unread result in a failing test.** On Python 3.11 and later, a query
   result left unread keeps a SQLite read lock until it is garbage-collected,
   and pytest keeps the last failure's traceback. On a file you named, that can
-  block the drop at the end of the run; pytest-sqla then says so.
+  block the drop at the end of the run; pytest-sqla then says so. A query that
+  a test cancels, for example with `asyncio.wait_for`, kept the write lock the
+  same way on aiosqlite; pytest-sqla collects it at that test's teardown.
 
 ## MySQL notes
 
-MySQL commits implicitly on DDL (`CREATE`, `ALTER`, `DROP`, `TRUNCATE`) and on
-`LOCK TABLES`, which ends the test's transaction: the rows the test wrote
-before that point are now permanent. pytest-sqla notices, because its guard
-savepoint is gone, and fails that test with IsolationError. Run such statements
-outside the sqla fixtures. MariaDB uses the same code path but is not tested in
-CI. Non-transactional tables (MyISAM, MEMORY) cannot be rolled back at all.
+MySQL commits implicitly on DDL (`CREATE`, `ALTER`, `DROP`, `TRUNCATE`), on
+`LOCK TABLES` and on `SET autocommit = 1`, which ends the test's transaction:
+the rows the test wrote before that point may now be permanent. pytest-sqla
+notices, because its guard savepoint is gone, fails that test with
+IsolationError, and discards the connection. Run such statements outside the
+sqla fixtures.
+
+A deadlock is not a breach. InnoDB rolls the victim's whole transaction back,
+savepoints included, and with it the rows the test seeded before the
+deadlock; nothing was committed. Without help, SQLAlchemy's next rollback to a
+savepoint would then fail with "(1305, 'SAVEPOINT sa_savepoint_2 does not
+exist')", which the application would see instead of the deadlock. So after a
+deadlock (1213) pytest-sqla re-creates the savepoints SQLAlchemy still holds
+before its next savepoint operation: the application sees 1213 as it would in
+production, its `rollback()` works, a retry commits, and the guard watches
+the rest of the test. With `innodb_rollback_on_timeout = ON`, a lock wait
+timeout (1205) rolls the transaction back too, and pytest-sqla reports it as a
+breach; that server setting is not tested.
+
+MariaDB uses the same code path but is not tested in CI. Non-transactional
+tables (MyISAM, MEMORY) cannot be rolled back at all.
 
 ## pytest-xdist
 
-All workers of a run share one database. They cannot see each other's data,
-because no test ever commits. The schema is created by the first worker under
-a database lock (`pg_advisory_xact_lock` on PostgreSQL, `GET_LOCK` on MySQL,
-`BEGIN IMMEDIATE` on SQLite), joined by the others, and dropped by the last
-one out. Measured before this design: a `create_all` per worker with `-n 4`
-ended "2 passed, 6 errors" on every run against both servers.
+PostgreSQL and MySQL workers of one run share one database; SQLite workers
+each get their own, a file per worker in create mode and an in-memory database
+per process. Under the default isolation levels a worker never reads another
+worker's rows, because no test commits; pytest-sqla refuses `READ UNCOMMITTED`
+for that reason. The schema is created by the first worker under a database
+lock (`pg_advisory_xact_lock` on PostgreSQL, `GET_LOCK` on MySQL), joined by
+the others, and dropped by the last one out; on SQLite, `BEGIN IMMEDIATE` only
+orders separate runs. Measured before this design: a `create_all` per worker
+with `-n 4` ended "2 passed, 6 errors" on every run against both servers.
 
 Limits:
 
 - Two workers inserting the same unique value wait on each other until one
-  test ends.
-- Sequences and AUTO_INCREMENT counters are shared, so do not assert ids.
+  test ends, and two that insert the same values in opposite orders deadlock:
+  measured on every run, with PostgreSQL's DeadlockDetected and MySQL's 1213.
+  Make such values unique per test, or insert them in one order.
 - One run per database: a second pytest run on the same database while the
   first is going gets SchemaConflictError. Per-run databases are on the
   roadmap.
-- A worker that crashes never leaves, so its run's tables stay behind and the
-  next run asks for `--sqla-recreate-schema`.
+- A worker that crashes never leaves, so its run's tables stay behind, a
+  per-worker SQLite file included, and the next run asks for
+  `--sqla-recreate-schema`.
 - Schema locks exist for PostgreSQL, MySQL, MariaDB and SQLite. Any other
   dialect works in a single process; under xdist, create the schema beforehand
   and set `sqla_schema = none`.
@@ -419,14 +511,19 @@ URL, the wrong driver family, an async fixture in a sync test) fail the test at
 setup. Three exception classes, all subclasses of `pytest_sqla.PytestSqlaError`:
 
 - **IsolationError**, at the teardown of the test that broke isolation: it
-  committed the connection itself (`session.connection().commit()`), or the
-  database ended the transaction on its own. A plain `connection.rollback()`
-  escapes nothing and is not an error.
-- **LoopMismatchError**, a `RuntimeError` too, at the first statement run on
-  the wrong event loop.
-- **SchemaConflictError**, from `sqla_schema`, on every database test: tables
-  it did not create, another run's schema, a lock that timed out, or a drop
-  blocked by a leaked transaction.
+  committed the connection itself (`session.connection().commit()`), the
+  database ended the transaction on its own, or it committed on a second
+  connection of pytest-sqla's engine (`sqla_session.get_bind().engine.begin()`).
+  The same class reports a task the test left running on its connection, and
+  a teardown that did not finish within `sqla_lock_timeout`. A plain
+  `connection.rollback()` escapes nothing and is not an error, and neither is
+  a MySQL deadlock.
+- **LoopMismatchError**, a `RuntimeError` too, at the first statement, COMMIT
+  or ROLLBACK run on the wrong event loop.
+- **SchemaConflictError**, from `sqla_schema`: on every database test for
+  tables it did not create, another run's schema, or a lock that timed out
+  during creation; once, at the end of the run, for a drop blocked by a leaked
+  transaction.
 
 A test's own failure always wins: a breach found at teardown is reported as a
 separate error and never replaces it. URLs in messages always hide the
@@ -438,14 +535,21 @@ password.
 | --- | --- | --- |
 | pytest-async-sqlalchemy | `--database-url`, `database_url` | `--sqla-url`, `sqla_url` |
 | | `db_session`, `dbsession` | `sqla_async_session` |
+| | `_database_url` | override `sqla_url` |
 | | `init_database` | `sqla_metadata` |
 | | your `event_loop` fixture override | delete it |
 | pytest-sqlalchemy | `--sqlalchemy-connect-url` | `--sqla-url` |
 | | `connection`, `transaction` | `sqla_connection` |
 | | `dbsession` | `sqla_session` |
-| | `--sqlalchemy-manage-db`, `db_schema` | `sqla_schema` |
+| | `--sqlalchemy-manage-db`, `db_schema` | `sqla_schema` creates tables, not the database |
 | sqlalchemyseed | your `engine` fixture, the SQLite listeners, StaticPool | `sqla_url`; delete the rest |
 | | `sqlalchemyseed_session` | override it to return `sqla_session`, and keep `seed` |
+
+pytest-sqla never creates or drops a database: pytest-sqlalchemy's `db_schema`
+and pytest-async-sqlalchemy's `database` fixture did, per xdist worker in the
+former's case. Create the database before the run, or supply it from a
+container fixture as below; all workers of a run share it (per-worker
+databases are on the roadmap).
 
 ## Using it with database fixtures
 
@@ -470,10 +574,23 @@ fixtures plug in the same way.
 
 - Code that builds its own engine or sessionmaker, instead of the one you
   inject, works outside the test transaction, and pytest-sqla cannot roll it
-  back.
+  back; it cannot even notice. Code that opens a second connection from
+  pytest-sqla's own engine commits for real too, but that is reported.
 - One connection per test: running two sessions concurrently, as with
   `asyncio.gather`, fails as it would on one connection in production.
-  Requests within one test must run one after another.
+  Requests within one test must run one after another, and every task that
+  uses the connection must be done before the test ends.
+- Isolation levels are the engine's: application code that asks for its own
+  per unit of work, as with
+  `session.connection(execution_options={"isolation_level": "SERIALIZABLE"})`,
+  gets SQLAlchemy's InvalidRequestError, because the test's transaction has
+  already begun.
+- Sequences and AUTO_INCREMENT counters are not transactional on PostgreSQL
+  and MySQL: a rolled-back insert still uses up its id, so ids keep growing
+  from test to test, while SQLite reuses them. Do not assert ids.
+- Session state survives a rollback on a pooled connection: a `poolclass` of
+  your own, or a class, module, package or session loop, shares connections
+  between tests (see Pooling).
 - CREATE SCHEMA for schema-qualified metadata is up to you.
 
 ## Compatibility

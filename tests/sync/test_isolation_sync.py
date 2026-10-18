@@ -328,10 +328,11 @@ def test_the_database_ending_the_transaction_is_reported(
         [
             "E *pytest_sqla.IsolationError: pytest-sqla: the database ended "
             "test_inner.py::test_ends_it's transaction on its own, so rows the test wrote before "
-            "that point are now permanent and visible to later tests. On MySQL and MariaDB, DDL "
-            "(CREATE, ALTER, DROP, TRUNCATE) and LOCK TABLES commit implicitly, and on SQLite so "
-            "do sqlite3's executescript() and a raw COMMIT; run such statements outside the sqla "
-            "fixtures. The driver reported: no such savepoint: sa_savepoint_1",
+            "that point may now be permanent and visible to later tests. A raw COMMIT or "
+            "ROLLBACK statement does that on any database; on MySQL and MariaDB so do DDL "
+            "(CREATE, ALTER, DROP, TRUNCATE) and LOCK TABLES, which commit implicitly, and on "
+            "SQLite sqlite3's executescript(). Run such statements outside the sqla fixtures. The "
+            "driver reported: no such savepoint: sa_savepoint_1",
         ]
     )
     assert users(database) == ["leak@example.com"]
@@ -436,3 +437,115 @@ def test_a_sync_fixture_suggests_a_sync_driver(
     result.stdout.fnmatch_lines(
         [f"*uses the async driver {driver}.*(for example {example}://...)*"]
     )
+
+
+def test_a_commit_on_a_second_connection_of_the_engine_is_reported(project: Project) -> None:
+    """Code reaching pytest-sqla's own engine, such as an "independent" audit transaction."""
+    project.models()
+    project.ini(sqla_url="sqlite://")
+    project.tests(
+        """
+        from sqlalchemy import text
+        from models import count
+
+        def test_escapes(sqla_session):
+            with sqla_session.get_bind().engine.begin() as other:
+                other.execute(text("INSERT INTO user_account (email) VALUES ('audit')"))
+
+        def test_reading_without_a_commit_is_fine(sqla_connection):
+            with sqla_connection.engine.connect() as other:
+                other.execute(text("SELECT count(*) FROM user_account"))
+
+        def test_later(sqla_session):
+            assert count(sqla_session) == 1, "the leak is real, which is why it is an error"
+        """
+    )
+    result = project.run()
+    result.assert_outcomes(passed=3, errors=1)
+    result.stdout.fnmatch_lines(
+        [
+            "*ERROR at teardown of test_escapes*",
+            "E *pytest_sqla.IsolationError: pytest-sqla: test_inner.py::test_escapes committed on "
+            "a second connection of the engine behind sqla_session (for example "
+            "sqla_session.get_bind().engine.begin()), so what it wrote there is permanent and "
+            "visible to later tests. Use the test's own session or connection, whose work "
+            "pytest-sqla rolls back.",
+        ]
+    )
+
+
+# ------------------------------------------------ one DBAPI connection per test
+
+SESSION_STATE = """
+from models import User, count
+
+def test_sets_session_state(sqla_connection):
+    sqla_connection.exec_driver_sql("PRAGMA query_only = 1")
+
+def test_writes_after_it(sqla_session):
+    sqla_session.add(User(email="ada@example.com"))
+    sqla_session.commit()
+    assert count(sqla_session) == 1
+"""
+QUEUE_POOL = """
+import pytest
+from sqlalchemy.pool import QueuePool
+
+@pytest.fixture(scope="session")
+def sqla_engine_options():
+    return {"poolclass": QueuePool}
+"""
+
+
+def test_session_state_does_not_reach_the_next_test(project: Project) -> None:
+    """ROLLBACK undoes rows, not a connection's state, so no connection is reused."""
+    project.models()
+    project.ini(sqla_url="sqlite://")
+    project.tests(
+        SESSION_STATE
+        + """
+def test_the_sync_engine_is_unpooled(sqla_connection):
+    from sqlalchemy.pool import NullPool
+    assert isinstance(sqla_connection.engine.pool, NullPool)
+"""
+    )
+    project.run().assert_outcomes(passed=3)
+
+
+def test_with_a_pool_of_your_own_session_state_carries_over(project: Project) -> None:
+    """The control: what a pooled sync engine hands the next test."""
+    project.models()
+    project.ini(sqla_url="sqlite://")
+    project.conftest(QUEUE_POOL)
+    project.tests(SESSION_STATE)
+    result = project.run()
+    result.assert_outcomes(passed=1, failed=1)
+    result.stdout.fnmatch_lines(["*attempt to write a readonly database*"])
+
+
+def test_a_connection_whose_transaction_broke_is_not_handed_on(project: Project) -> None:
+    """Even with a pool: after a breach the connection is discarded, its state with it.
+
+    Measured on MySQL before this: after SET autocommit = 1, every later test on
+    the pooled connection committed for real and got the breach of its own.
+    """
+    project.models()
+    project.ini(sqla_url="sqlite://")
+    project.conftest(QUEUE_POOL)
+    project.tests(
+        """
+        from models import User, count
+
+        def test_breaks_it(sqla_connection):
+            sqla_connection.exec_driver_sql("PRAGMA query_only = 1")
+            sqla_connection.connection.dbapi_connection.executescript("SELECT 1;")
+
+        def test_writes_after_it(sqla_session):
+            sqla_session.add(User(email="ada@example.com"))
+            sqla_session.commit()
+            assert count(sqla_session) == 1
+        """
+    )
+    result = project.run()
+    result.assert_outcomes(passed=2, errors=1)
+    result.stdout.fnmatch_lines(["*IsolationError*test_breaks_it's transaction on its own*"])

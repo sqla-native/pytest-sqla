@@ -13,7 +13,7 @@ from sqlalchemy.engine import make_url
 from sqlalchemy.orm import Session
 
 from pytest_sqla import _sqlite
-from tests.helpers import Project
+from tests.helpers import Project, sqlite_rows, sqlite_script
 
 metadata = MetaData()
 item = Table("item", metadata, Column("id", Integer, primary_key=True), Column("name", String(20)))
@@ -73,19 +73,24 @@ def test_the_plugins_engine_carries_the_fix(project: Project, url: str, begin: s
     project.run().assert_outcomes(passed=1)
 
 
-@pytest.mark.skipif(sys.version_info < (3, 12), reason="sqlite3 autocommit arrived in 3.12")
-def test_pep_249_mode_needs_no_fix_and_gets_none(project: Project) -> None:
+PEP_249 = """
+import pytest
+
+@pytest.fixture(scope="session")
+def sqla_engine_options():
+    return {"connect_args": {"autocommit": False, "timeout": 0.2}}
+"""
+needs_pep_249 = pytest.mark.skipif(
+    sys.version_info < (3, 12), reason="sqlite3 autocommit arrived in 3.12"
+)
+
+
+@needs_pep_249
+def test_pep_249_mode_needs_no_fix_but_still_takes_the_write_lock(project: Project) -> None:
+    """No second BEGIN, but on a file the test transaction still begins IMMEDIATE."""
     project.models()
     project.sqlite()
-    project.conftest(
-        """
-        import pytest
-
-        @pytest.fixture(scope="session")
-        def sqla_engine_options():
-            return {"connect_args": {"autocommit": False}}
-        """
-    )
+    project.conftest(PEP_249)
     project.tests(
         """
         from sqlalchemy import event
@@ -94,7 +99,9 @@ def test_pep_249_mode_needs_no_fix_and_gets_none(project: Project) -> None:
 
         def test_commits(sqla_session):
             engine = sqla_session.get_bind().engine
+            assert not event.contains(engine, "connect", _sqlite.disable_implicit_transactions)
             assert not event.contains(engine, "begin", _sqlite.begin_immediate)
+            assert event.contains(engine, "begin", _sqlite.restart_immediate)
             sqla_session.add(User(email="ada@example.com"))
             sqla_session.commit()
             assert count(sqla_session) == 1
@@ -104,6 +111,66 @@ def test_pep_249_mode_needs_no_fix_and_gets_none(project: Project) -> None:
         """
     )
     project.run().assert_outcomes(passed=2)
+
+
+@needs_pep_249
+def test_a_raw_commit_in_pep_249_mode_is_reported(project: Project) -> None:
+    """Measured before: the root rollback raised "cannot rollback - no transaction is
+    active", and that raw OperationalError hid the breach."""
+    project.models()
+    project.sqlite()
+    project.ini(sqla_schema="none")
+    sqlite_script(
+        project.path / "test.db",
+        ["CREATE TABLE user_account (id INTEGER PRIMARY KEY, email VARCHAR(100) UNIQUE)"],
+    )
+    project.conftest(PEP_249)
+    project.tests(
+        """
+        from sqlalchemy import text
+        from models import User
+
+        def test_ends_it(sqla_session):
+            sqla_session.add(User(email="leak@example.com"))
+            sqla_session.flush()
+            sqla_session.execute(text("COMMIT"))
+        """
+    )
+    result = project.run()
+    result.assert_outcomes(passed=1, errors=1)
+    result.stdout.fnmatch_lines(
+        [
+            "E *pytest_sqla.IsolationError: pytest-sqla: the database ended "
+            "test_inner.py::test_ends_it's transaction on its own*The driver reported: no such "
+            "savepoint: sa_savepoint_1"
+        ]
+    )
+    rows = sqlite_rows(project.path / "test.db", "SELECT email FROM user_account")
+    assert rows == [("leak@example.com",)]
+
+
+@needs_pep_249
+def test_a_write_lock_that_never_comes_leaves_sqlite3_its_transaction(project: Project) -> None:
+    """PEP 249 mode expects a transaction open; without one, the pool's reset failed."""
+    project.models()
+    project.sqlite()
+    project.conftest(PEP_249)
+    project.tests(
+        """
+        import logging
+        import pytest
+        from sqlalchemy.exc import OperationalError
+
+        def test_a_second_writer(sqla_connection, caplog):
+            other = sqla_connection.engine.connect()
+            with pytest.raises(OperationalError, match="database is locked"):
+                other.begin()
+            other.close()
+            errors = [record for record in caplog.records if record.levelno >= logging.ERROR]
+            assert errors == []
+        """
+    )
+    project.run().assert_outcomes(passed=1)
 
 
 def test_the_legacy_check_follows_the_runtime_default(monkeypatch: pytest.MonkeyPatch) -> None:

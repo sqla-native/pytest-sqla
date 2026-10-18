@@ -7,6 +7,8 @@ created once under a lock and dropped by the last worker - is in
 
 from __future__ import annotations
 
+import sys
+
 import pytest
 
 from tests.helpers import Project, sqlite_script
@@ -52,6 +54,29 @@ def test_none_mode_shares_the_configured_file(project: Project) -> None:
     project.models()
     project.sqlite()
     project.ini(sqla_schema="none")
+    sqlite_script(
+        project.path / "test.db",
+        ["CREATE TABLE user_account (id INTEGER PRIMARY KEY, email VARCHAR(100) UNIQUE)"],
+    )
+    project.tests(MANY_TESTS)
+    project.run_subprocess("-n", "2").assert_outcomes(passed=9)
+
+
+@pytest.mark.skipif(sys.version_info < (3, 12), reason="sqlite3 autocommit arrived in 3.12")
+def test_none_mode_shares_the_file_in_pep_249_mode_too(project: Project) -> None:
+    """Measured without the write lock at BEGIN: "1 failed, 8 passed", database is locked."""
+    project.models()
+    project.sqlite()
+    project.ini(sqla_schema="none")
+    project.conftest(
+        """
+        import pytest
+
+        @pytest.fixture(scope="session")
+        def sqla_engine_options():
+            return {"connect_args": {"autocommit": False}}
+        """
+    )
     sqlite_script(
         project.path / "test.db",
         ["CREATE TABLE user_account (id INTEGER PRIMARY KEY, email VARCHAR(100) UNIQUE)"],

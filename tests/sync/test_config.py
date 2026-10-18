@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import sys
+
 import pytest
 
-from tests.helpers import Project
+from tests.helpers import HAS_PYTEST_ASYNCIO, Project
 
 PRINT_URLS = """
 def test_urls(sqla_url, sqla_async_url):
@@ -48,7 +50,9 @@ def test_the_ini_is_the_committed_default(project: Project) -> None:
     project.ini(sqla_url="sqlite:///ini.db", sqla_schema="none")
     result = urls(project)
     result.stdout.fnmatch_lines(["sqla_url: sqlite:///ini.db"])
-    result.stdout.fnmatch_lines(["sqla: url=sqlite:///ini.db (from sqla_url), schema=none"])
+    result.stdout.fnmatch_lines(
+        ["sqla: url=sqlite:///ini.db (from the sqla_url ini key), schema=none"]
+    )
 
 
 def test_the_async_url_has_the_same_precedence(
@@ -62,7 +66,7 @@ def test_the_async_url_has_the_same_precedence(
     )
     result.stdout.fnmatch_lines(
         [
-            "sqla: url=sqlite:///a.db (from sqla_url), "
+            "sqla: url=sqlite:///a.db (from the sqla_url ini key), "
             "async_url=sqlite+aiosqlite:///./a.db (from --sqla-async-url), schema=create"
         ]
     )
@@ -212,12 +216,23 @@ def test_sqla_schema_must_be_create_or_none(project: Project, value: str) -> Non
     )
 
 
-@pytest.mark.parametrize("value", ["0", "-1", "soon", "nan", "inf"])
-def test_the_lock_timeout_must_be_a_positive_number(project: Project, value: str) -> None:
+@pytest.mark.parametrize(
+    ("value", "reason"),
+    [
+        ("0", ", got 0."),
+        ("-1", ", got -1."),
+        ("nan", ", got nan."),
+        ("inf", ", got inf."),
+        ("soon", ": could not convert string to float: 'soon'."),
+    ],
+)
+def test_the_lock_timeout_must_be_a_positive_number(
+    project: Project, value: str, reason: str
+) -> None:
     project.ini(sqla_lock_timeout=value)
     result = usage_error(project)
     result.stderr.fnmatch_lines(
-        [f"*pytest-sqla: sqla_lock_timeout must be a positive number of seconds, got {value!r}."]
+        [f"*pytest-sqla: sqla_lock_timeout must be a positive number of seconds{reason}"]
     )
 
 
@@ -233,10 +248,10 @@ def test_a_fractional_lock_timeout_is_fine(project: Project) -> None:
         ("--sqla-url", ("--sqla-url", "postgresql://ada:s3cret@host:port/db"), None, None),
         ("PYTEST_SQLA_URL", (), ("PYTEST_SQLA_URL", "not a url, s3cret"), None),
         ("PYTEST_SQLA_URL", (), ("PYTEST_SQLA_URL", ""), None),
-        ("sqla_url", (), None, ("sqla_url", "postgresql://ada:s3cret@host:port/db")),
+        ("the sqla_url ini key", (), None, ("sqla_url", "postgresql://ada:s3cret@host:port/db")),
         ("--sqla-async-url", ("--sqla-async-url", "://s3cret"), None, None),
         ("PYTEST_SQLA_ASYNC_URL", (), ("PYTEST_SQLA_ASYNC_URL", "s3cret"), None),
-        ("sqla_async_url", (), None, ("sqla_async_url", "mysql://u:s3cret@h:x/d")),
+        ("the sqla_async_url ini key", (), None, ("sqla_async_url", "mysql://u:s3cret@h:x/d")),
     ],
 )
 def test_an_invalid_url_names_its_source_and_never_its_value(
@@ -279,7 +294,7 @@ def test_the_two_urls_must_name_the_same_database(project: Project) -> None:
     result.stderr.fnmatch_lines(
         [
             "*pytest-sqla: sqla_url and sqla_async_url must point at the same database, but "
-            "one is postgresql+psycopg://ada:***@one/app (from sqla_url) and the other "
+            "one is postgresql+psycopg://ada:***@one/app (from the sqla_url ini key) and the other "
             "postgresql+asyncpg://ada:***@two/app (from --sqla-async-url)."
         ]
     )
@@ -301,6 +316,54 @@ def test_the_same_database_through_another_driver_is_fine(
     project.ini(sqla_url=url, sqla_async_url=async_url)
     project.tests("def test_nothing():\n    pass\n")
     project.run().assert_outcomes(passed=1)
+
+
+def test_one_file_named_relative_and_absolute_is_one_database(project: Project) -> None:
+    """The sync URL relative to the working directory, the async one absolute."""
+    project.ini(
+        sqla_url="sqlite:///data.db",
+        sqla_async_url=f"sqlite+aiosqlite:///{project.path / 'data.db'}",
+    )
+    project.tests("def test_nothing():\n    pass\n")
+    project.run().assert_outcomes(passed=1)
+
+
+@pytest.mark.skipif(pytest.version_tuple < (9,), reason="native TOML configuration is pytest 9")
+@pytest.mark.parametrize("value", ["30", "0.5"])
+def test_the_lock_timeout_is_a_number_in_native_toml(pytester: pytest.Pytester, value: str) -> None:
+    """A string option made pytest 9 stop with an INTERNALERROR on sqla_lock_timeout = 30."""
+    asyncio = 'asyncio_default_fixture_loop_scope = "function"' if HAS_PYTEST_ASYNCIO else ""
+    pytester.makepyprojecttoml(
+        f"""
+        [tool.pytest]
+        addopts = ["-p", "no:cacheprovider"]
+        filterwarnings = ["error"]
+        sqla_lock_timeout = {value}
+        {asyncio}
+        """
+    )
+    pytester.makepyfile(test_inner="def test_nothing():\n    pass\n")
+    pytester.runpytest().assert_outcomes(passed=1)
+
+
+@pytest.mark.skipif(pytest.version_tuple < (9,), reason="native TOML configuration is pytest 9")
+def test_a_quoted_lock_timeout_in_native_toml_is_a_usage_error(pytester: pytest.Pytester) -> None:
+    pytester.makepyprojecttoml(
+        """
+        [tool.pytest]
+        addopts = ["-p", "no:cacheprovider"]
+        sqla_lock_timeout = "30"
+        """
+    )
+    pytester.makepyfile(test_inner="def test_nothing():\n    pass\n")
+    result = pytester.runpytest()
+    assert result.ret == pytest.ExitCode.USAGE_ERROR
+    result.stderr.fnmatch_lines(
+        [
+            "*pytest-sqla: sqla_lock_timeout must be a positive number of seconds: *config "
+            "option 'sqla_lock_timeout' expects a float, got str: '30'."
+        ]
+    )
 
 
 # ------------------------------------------------------- no database configured
@@ -361,6 +424,23 @@ def test_a_run_without_database_fixtures_stays_inert(project: Project) -> None:
     result.assert_outcomes(passed=1)
     result.stdout.fnmatch_lines(["*asyncio extension imported: False"])
     assert not (project.path / "never-created.db").exists()
+
+
+def test_a_python_without_sqlite3_still_loads_the_plugin(project: Project) -> None:
+    """A minimal or pyenv build can lack _sqlite3; a suite that never uses SQLite must run.
+
+    A subprocess, because sqlite3 must be missing before the plugin is imported.
+    """
+    project.tests("def test_unrelated():\n    pass\n")
+    project.write_ini()
+    result = project.pytester.run(
+        sys.executable,
+        "-c",
+        "import sys; sys.modules['sqlite3'] = sys.modules['_sqlite3'] = None; "
+        "import pytest; raise SystemExit(pytest.main([]))",
+    )
+    assert result.ret == pytest.ExitCode.OK
+    result.stdout.fnmatch_lines(["*1 passed*"])
 
 
 def test_the_plugin_can_be_disabled(project: Project) -> None:

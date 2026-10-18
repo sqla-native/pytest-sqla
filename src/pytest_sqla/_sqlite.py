@@ -20,7 +20,14 @@ lock gets "database is locked" immediately, because SQLite refuses the lock
 upgrade rather than deadlock: measured with two xdist workers sharing a file
 in none mode. An immediate one waits out the busy timeout instead, so the
 processes take turns. In-memory databases belong to one process and keep a
-plain ``BEGIN``.
+plain ``BEGIN``. PEP 249 mode always holds a deferred transaction open, which
+sqlite3 began itself and nothing has used yet, so there the listener rolls it
+back and begins an immediate one: measured on Python 3.12, a read then a
+write behind another writer failed at once without it and waited with it, and
+the savepoint rollback still left 0 rows.
+
+``sqlite3`` itself is imported only inside function bodies, so a Python built
+without it still loads the plugin for a suite that never uses SQLite.
 
 **In-memory databases.** A plain memory URL is private to one connection, so
 it is rewritten to a named database on SQLite's memdb VFS, which "allows the
@@ -36,20 +43,19 @@ and ``dispose()`` would otherwise discard it with its last connection.
 
 from __future__ import annotations
 
-import sqlite3
 from collections.abc import Mapping
 from pathlib import PurePath
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import pytest
 from sqlalchemy import event
 from sqlalchemy.engine import URL, Connection, Engine
+from sqlalchemy.exc import DBAPIError
+
+if TYPE_CHECKING:
+    import sqlite3
 
 MEMDB_MIN_VERSION = (3, 36, 0)
-
-# sqlite3's own legacy-mode marker. Python 3.12 added the attribute; before
-# that every connection runs in legacy mode, which the fallback expresses.
-_LEGACY = getattr(sqlite3, "LEGACY_TRANSACTION_CONTROL", -1)
 
 # The query parameters SQLAlchemy hands to sqlite3.connect() instead of putting
 # them in the SQLite URI (SQLiteDialect_pysqlite.create_connect_args).
@@ -94,7 +100,11 @@ def shared_memory_url(url: URL, name: str) -> URL:
     return url.set(database=f"file:/{name}", query={**url.query, "vfs": "memdb", "uri": "true"})
 
 
-def require_shared_memory(version: tuple[int, ...] = sqlite3.sqlite_version_info) -> None:
+def require_shared_memory(version: tuple[int, ...] | None = None) -> None:
+    if version is None:
+        import sqlite3
+
+        version = sqlite3.sqlite_version_info
     if version < MEMDB_MIN_VERSION:
         found = ".".join(str(part) for part in version)
         pytest.fail(
@@ -125,20 +135,35 @@ def keeper_target(url: URL) -> str:
 
 
 def open_keeper(target: str) -> sqlite3.Connection:
+    import sqlite3
+
     return sqlite3.connect(target, uri=True)
+
+
+def _legacy() -> object:
+    """sqlite3's own legacy-mode marker.
+
+    Python 3.12 added the attribute; before that every connection runs in
+    legacy mode, which the fallback expresses.
+    """
+    import sqlite3
+
+    return getattr(sqlite3, "LEGACY_TRANSACTION_CONTROL", -1)
 
 
 def default_autocommit() -> object:
     """What sqlite3 does when nobody passes ``autocommit``: legacy mode, until it is not."""
+    import sqlite3
+
     probe = sqlite3.connect(":memory:")
     try:
-        return getattr(probe, "autocommit", _LEGACY)
+        return getattr(probe, "autocommit", _legacy())
     finally:
         probe.close()
 
 
 def runs_legacy_transaction_control(connect_args: Mapping[str, Any]) -> bool:
-    return bool(connect_args.get("autocommit", default_autocommit()) == _LEGACY)
+    return bool(connect_args.get("autocommit", default_autocommit()) == _legacy())
 
 
 def disable_implicit_transactions(dbapi_connection: Any, _record: object) -> None:
@@ -156,15 +181,42 @@ def begin_immediate(connection: Connection) -> None:
     connection.exec_driver_sql("BEGIN IMMEDIATE")
 
 
+def restart_immediate(connection: Connection) -> None:
+    """The same in PEP 249 mode, where sqlite3 keeps a deferred transaction open.
+
+    On the DBAPI cursor, so that when the write lock does not come in time,
+    sqlite3's own transaction is begun again before the error is raised: PEP
+    249 mode expects one. Measured through ``exec_driver_sql``, SQLAlchemy's
+    error handling rolled back first and failed with "cannot rollback - no
+    transaction is active", which hid the "database is locked" it was raising.
+    """
+    dbapi = connection.dialect.loaded_dbapi
+    cursor = connection.connection.dbapi_connection.cursor()  # type: ignore[union-attr]
+    try:
+        cursor.execute("ROLLBACK")
+        try:
+            cursor.execute("BEGIN IMMEDIATE")
+        except dbapi.Error as error:
+            cursor.execute("BEGIN")
+            raise DBAPIError.instance("BEGIN IMMEDIATE", None, error, dbapi.Error) from error
+    finally:
+        cursor.close()
+
+
 def apply_savepoint_fix(
     sync_engine: Engine, connect_args: Mapping[str, Any], *, immediate: bool = False
 ) -> bool:
-    """Install the connect and begin listeners when the driver runs in legacy mode.
+    """Install the listeners the connection's transaction control needs.
 
-    Works for aiosqlite too, on ``AsyncEngine.sync_engine``: SQLAlchemy's
-    adapter forwards ``isolation_level`` to the sqlite3 connection.
+    In legacy mode, the documented connect and begin listeners; in PEP 249
+    mode, only the write lock at BEGIN, and only when ``immediate``. Returns
+    whether the legacy fix was installed. Works for aiosqlite too, on
+    ``AsyncEngine.sync_engine``: SQLAlchemy's adapter forwards
+    ``isolation_level`` to the sqlite3 connection.
     """
     if not runs_legacy_transaction_control(connect_args):
+        if immediate:
+            event.listen(sync_engine, "begin", restart_immediate)
         return False
     event.listen(sync_engine, "connect", disable_implicit_transactions)
     event.listen(sync_engine, "begin", begin_immediate if immediate else begin)

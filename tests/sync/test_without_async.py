@@ -17,18 +17,25 @@ F5 = (
     "test_inner.py::{test}. Mark it with @pytest.mark.asyncio (pip install "
     "pytest-sqla[[]asyncio]) or @pytest.mark.anyio, or set asyncio_mode = auto."
 )
+SYNC_TEST = (
+    "*pytest-sqla: {fixture} needs an async test, but test_inner.py::test_sync is a plain "
+    "def. Its connection is opened on the event loop the test runs on, and a synchronous test "
+    "has none, even when an async fixture of it does. Make the test async def, marked with "
+    "@pytest.mark.asyncio (pip install pytest-sqla[[]asyncio]) or @pytest.mark.anyio."
+)
 
 
 @pytest.mark.parametrize(
     "fixture", ["sqla_async_connection", "sqla_async_sessionmaker", "sqla_async_session"]
 )
 def test_a_sync_test_cannot_have_an_async_fixture(project: Project, fixture: str) -> None:
+    """Worded for the plain def, not as if no async plugin were installed."""
     project.models()
     project.sqlite()
     project.tests(f"def test_sync({fixture}):\n    pass\n")
     result = project.run()
     result.assert_outcomes(errors=1)
-    result.stdout.fnmatch_lines([F5.format(fixture=fixture, test="test_sync")])
+    result.stdout.fnmatch_lines([SYNC_TEST.format(fixture=fixture)])
 
 
 def test_an_async_test_without_an_async_plugin_fails_at_setup(project: Project) -> None:

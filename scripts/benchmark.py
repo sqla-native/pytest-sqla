@@ -12,7 +12,9 @@ drivers without one are left out. One cycle is what pytest-sqla does per test:
 connect, BEGIN and the guard SAVEPOINT, a session that inserts a row and
 commits (a savepoint and its release), the guard's ROLLBACK TO, ROLLBACK, and
 close. Best of 5 runs of 200 cycles, because a single run is too noisy to
-publish a number from.
+publish a number from. NullPool is what pytest-sqla uses for the sync engine
+and for a per-test event loop; the pooled column is what a pool of your own,
+or a wider loop scope, saves.
 """
 
 from __future__ import annotations
@@ -26,7 +28,7 @@ from sqlalchemy import Column, Integer, MetaData, String, Table
 from sqlalchemy.engine import URL, Engine, make_url
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 from sqlalchemy.orm import Session
-from sqlalchemy.pool import NullPool
+from sqlalchemy.pool import QueuePool
 
 from pytest_sqla._engines import async_engine, sync_engine
 from pytest_sqla._isolation import end_isolation, open_isolation
@@ -53,22 +55,30 @@ ASYNC = {
 def sync_cycle(engine: Engine) -> None:
     with engine.connect() as connection:
         isolation = open_isolation(connection)
-        with Session(bind=connection, join_transaction_mode="create_savepoint") as session:
-            session.execute(item.insert().values(name="x"))
-            session.commit()
-        assert end_isolation(isolation, nodeid="bench", fixture="bench") is None
+        try:
+            with Session(bind=connection, join_transaction_mode="create_savepoint") as session:
+                session.execute(item.insert().values(name="x"))
+                session.commit()
+            assert end_isolation(isolation, nodeid="bench", fixture="bench") is None
+        finally:
+            isolation.unwatch()
 
 
 async def async_cycle(engine: AsyncEngine) -> None:
     async with engine.connect() as connection:
         isolation = await connection.run_sync(open_isolation)
-        async with AsyncSession(bind=connection, join_transaction_mode="create_savepoint") as s:
-            await s.execute(item.insert().values(name="x"))
-            await s.commit()
-        breach = await connection.run_sync(
-            lambda _connection: end_isolation(isolation, nodeid="bench", fixture="bench")
-        )
-        assert breach is None
+        try:
+            async with AsyncSession(
+                bind=connection, join_transaction_mode="create_savepoint"
+            ) as session:
+                await session.execute(item.insert().values(name="x"))
+                await session.commit()
+            breach = await connection.run_sync(
+                lambda _connection: end_isolation(isolation, nodeid="bench", fixture="bench")
+            )
+            assert breach is None
+        finally:
+            isolation.unwatch()
 
 
 def best_sync(engine: Engine) -> float:
@@ -94,10 +104,10 @@ async def best_async(engine: AsyncEngine, cycle: Callable[[AsyncEngine], Awaitab
 
 
 def measure_sync(url: URL) -> tuple[float, float]:
-    pooled = sync_engine(url, {})
+    pooled = sync_engine(url, {"poolclass": QueuePool})
     metadata.create_all(pooled)
     try:
-        nullpool = sync_engine(url, {"poolclass": NullPool})
+        nullpool = sync_engine(url, {})  # the default
         return best_sync(pooled), best_sync(nullpool)
     finally:
         metadata.drop_all(pooled)

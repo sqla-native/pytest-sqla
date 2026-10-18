@@ -133,8 +133,9 @@ def _create_or_join(connection: Connection, plan: Plan) -> str:
         raise SchemaConflictError(
             f"pytest-sqla: the database at {render(plan.url)} holds the schema of another "
             f"pytest-sqla run (started {other.started_at} by {other.owner}; {other.workers} "
-            "worker(s) never finished). If no other test run uses this database, run again "
-            "with --sqla-recreate-schema; otherwise give this run a database of its own."
+            "worker(s) still running, or crashed). If no other test run uses this database, "
+            "run again with --sqla-recreate-schema; otherwise give this run a database of its "
+            "own."
         )
     for metadata in reversed(plan.metadatas):
         metadata.drop_all(connection)
@@ -242,26 +243,38 @@ def _blocked_drop(plan: Plan, error: DBAPIError) -> SchemaConflictError:
     )
 
 
+def _blocked_creation(plan: Plan, error: DBAPIError) -> SchemaConflictError:
+    return SchemaConflictError(
+        f"pytest-sqla: gave up after {plan.lock_timeout:g} s waiting for a lock on the tables "
+        f"of the test schema in {render(plan.url)}: another connection holds one, usually a "
+        "test of the pytest-sqla run whose schema this is, still going. Give this run a "
+        "database of its own, or wait for that run to finish. The driver reported: "
+        f"{error.orig}"
+    )
+
+
+_Explanation = Callable[[Plan, DBAPIError], SchemaConflictError]
+
+
 @contextlib.contextmanager
-def _waiting(connection: Connection, plan: Plan, *, blocked_drop: bool) -> Iterator[None]:
+def _waiting(connection: Connection, plan: Plan, explain: _Explanation) -> Iterator[None]:
     """Turn a lock wait that timed out into the error that explains it.
 
-    ``blocked_drop`` picks the explanation: a drop held up by a leaked
-    transaction (S4), or the schema lock held by another process (S3).
+    ``explain`` names the cause: the schema lock held by another process
+    (S3), a drop held up by a leaked transaction (S4), or creation - in
+    practice --sqla-recreate-schema dropping another run's tables - held up by
+    a run still using them.
     """
     try:
         yield
     except DBAPIError as error:
         if not _lock_timed_out(connection, error):
             raise
-        explained = _blocked_drop(plan, error) if blocked_drop else _waited_too_long(plan, error)
-        raise explained from error
+        raise explain(plan, error) from error
 
 
 def _do(connection: Connection, plan: Plan, work: _Work, ending: bool) -> str:
-    if not ending:
-        return work(connection, plan)
-    with _waiting(connection, plan, blocked_drop=True):
+    with _waiting(connection, plan, _blocked_drop if ending else _blocked_creation):
         return work(connection, plan)
 
 
@@ -269,7 +282,7 @@ def _postgresql(connection: Connection, plan: Plan, work: _Work, ending: bool) -
     milliseconds = max(1, round(plan.lock_timeout * 1000))
     with connection.begin():
         connection.exec_driver_sql(f"SET LOCAL lock_timeout = '{milliseconds}ms'")
-        with _waiting(connection, plan, blocked_drop=False):
+        with _waiting(connection, plan, _waited_too_long):
             connection.execute(select(func.pg_advisory_xact_lock(_ADVISORY_KEY)))
         return _do(connection, plan, work, ending)
 
@@ -293,7 +306,8 @@ def _mysql(connection: Connection, plan: Plan, work: _Work, ending: bool) -> str
 def _sqlite(connection: Connection, plan: Plan, work: _Work, ending: bool) -> str:
     # BEGIN IMMEDIATE (through the listener) waits for other writers, and
     # COMMIT for readers. At session end the likely holder is a test's leak.
-    with _waiting(connection, plan, blocked_drop=ending), connection.begin():
+    explain = _blocked_drop if ending else _waited_too_long
+    with _waiting(connection, plan, explain), connection.begin():
         return _do(connection, plan, work, ending)
 
 

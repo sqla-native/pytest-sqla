@@ -34,21 +34,26 @@ class SchemaConflictError(PytestSqlaError):
 
     Raised by ``sqla_schema``: the database holds tables pytest-sqla did not
     create, or another run's schema, or a lock could not be taken in time.
-    Because the fixture is session-scoped, every database test reports it.
+    The fixture is session-scoped, so a conflict at creation fails every
+    database test, and one at the drop fails the last teardown of the run.
     """
 
 
 class IsolationError(PytestSqlaError):
-    """A test's writes escaped the transaction meant to roll them back.
+    """A test broke the transaction meant to roll its writes back.
 
-    Raised at the teardown of the test that caused it, so the breach is
-    reported where it happened instead of leaking into later tests.
+    Its writes escaped through a commit, or the database ended the
+    transaction on its own; or it left a task using the connection, which
+    pytest-sqla then closed instead of rolling back. Raised at the teardown of
+    the test that caused it, so the breach is reported where it happened, not
+    discovered in a later test.
     """
 
 
 class LoopMismatchError(PytestSqlaError, RuntimeError):
     """An async connection was used from an event loop it does not belong to.
 
-    Raised before the driver sees the statement, which keeps the connection
-    usable: asyncpg's connection is left broken by a cross-loop call.
+    Raised before the driver sees the statement, COMMIT or ROLLBACK, which
+    keeps the connection usable: asyncpg's connection is left broken by a
+    cross-loop call.
     """

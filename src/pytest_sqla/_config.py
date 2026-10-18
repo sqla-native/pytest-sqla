@@ -21,6 +21,7 @@ import os
 import re
 import uuid
 from dataclasses import dataclass
+from typing import Literal
 
 import pytest
 from sqlalchemy import MetaData
@@ -30,7 +31,14 @@ from sqlalchemy.exc import ArgumentError
 from . import _sqlite
 
 SCHEMA_MODES = ("create", "none")
-DEFAULT_LOCK_TIMEOUT = "30"
+DEFAULT_LOCK_TIMEOUT = 30.0
+# pytest 9's native TOML ([tool.pytest], pytest.toml) type-checks values: a
+# string option refused sqla_lock_timeout = 30 with an INTERNALERROR. pytest
+# 8.4 added the float type, which takes a number there and parses one in ini
+# files; 8.2 and 8.3 only know strings.
+_LOCK_TIMEOUT_TYPE: Literal["float", "string"] = (
+    "float" if pytest.version_tuple >= (8, 4) else "string"
+)
 
 _METADATA_PATH = re.compile(r"[A-Za-z_][\w.]*:[A-Za-z_][\w.]*")
 _DEFAULT_PORTS = {"postgresql": 5432, "mysql": 3306}
@@ -53,7 +61,9 @@ ASYNC_URL_ORIGIN = Origin("--sqla-async-url", "PYTEST_SQLA_ASYNC_URL", "sqla_asy
 class ConfiguredURL:
     url: URL
     source: str
-    """Which of the three places it came from, so the report header can say."""
+    """Which of the three places it came from, so the report header can say:
+    the option, the variable, or "the sqla_url ini key", never to be read as
+    the sqla_url fixture, which an override can replace."""
 
 
 @dataclass(frozen=True)
@@ -109,7 +119,8 @@ def add_options(parser: pytest.Parser) -> None:
     )
     parser.addini(
         "sqla_lock_timeout",
-        "Seconds to wait for the schema lock and for DDL locks. Default 30.",
+        "Seconds to wait for the schema lock, for DDL locks and for a test's rollback. Default 30.",
+        type=_LOCK_TIMEOUT_TYPE,
         default=DEFAULT_LOCK_TIMEOUT,
     )
 
@@ -121,7 +132,7 @@ def read_settings(config: pytest.Config) -> Settings:
         raise pytest.UsageError(
             f"pytest-sqla: sqla_schema must be 'create' or 'none', got {schema_mode!r}."
         )
-    lock_timeout = _lock_timeout(str(config.getini("sqla_lock_timeout")))
+    lock_timeout = _lock_timeout(config)
     metadata_path = str(config.getini("sqla_metadata")) or None
     if metadata_path is not None and not _METADATA_PATH.fullmatch(metadata_path):
         raise pytest.UsageError(
@@ -147,14 +158,17 @@ def read_settings(config: pytest.Config) -> Settings:
     )
 
 
-def _lock_timeout(raw: str) -> float:
+def _lock_timeout(config: pytest.Config) -> float:
+    """Seconds, from a number or a numeric string; pytest may already have parsed it."""
     try:
-        seconds = float(raw)
-    except ValueError:
-        seconds = math.nan
+        seconds = float(config.getini("sqla_lock_timeout"))
+    except (TypeError, ValueError) as error:
+        raise pytest.UsageError(
+            f"pytest-sqla: sqla_lock_timeout must be a positive number of seconds: {error}."
+        ) from None
     if not (math.isfinite(seconds) and seconds > 0):
         raise pytest.UsageError(
-            f"pytest-sqla: sqla_lock_timeout must be a positive number of seconds, got {raw!r}."
+            f"pytest-sqla: sqla_lock_timeout must be a positive number of seconds, got {seconds:g}."
         )
     return seconds
 
@@ -169,7 +183,7 @@ def _configured_url(config: pytest.Config, origin: Origin) -> ConfiguredURL | No
     candidates = (
         (origin.option, config.getoption(origin.option)),
         (origin.variable, os.environ.get(origin.variable)),
-        (origin.ini, str(config.getini(origin.ini)) or None),
+        (f"the {origin.ini} ini key", str(config.getini(origin.ini)) or None),
     )
     for source, raw in candidates:
         if raw is not None:
@@ -206,8 +220,11 @@ def _identity(url: URL) -> tuple[object, ...]:
     backend = url.get_backend_name()
     family = "mysql" if backend == "mariadb" else backend
     if family == "sqlite":
-        memory = _sqlite.is_plain_memory(url)
-        return (family, None if memory else os.path.normpath(str(url.database)))
+        if _sqlite.is_plain_memory(url):
+            return (family, None)
+        # sqlite3 opens a relative path from the working directory, as this
+        # does; one file reached through a symlink is still one database.
+        return (family, os.path.normcase(os.path.realpath(str(url.database))))
     port = url.port if url.port is not None else _DEFAULT_PORTS.get(family)
     return (family, url.host, port, url.database, url.username)
 
