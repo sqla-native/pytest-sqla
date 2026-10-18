@@ -1,0 +1,41 @@
+# Disposable databases for the gated real-database suite.
+#
+#   docker compose up -d --wait
+#   ./scripts/test-integration.sh
+#   docker compose down -v
+#
+# The default test run needs none of this: those specs skip unless their
+# environment variables are set, so a fork clones and runs green with no Docker.
+# The host ports differ from queryspy's (55432, 53306) so both projects can
+# run their databases at once, and MySQL is trimmed to fit a small machine.
+name: pytest-sqla
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: sqla
+      POSTGRES_PASSWORD: sqla
+      POSTGRES_DB: sqla
+    ports:
+      - "127.0.0.1:55434:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sqla"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_DATABASE: sqla
+      MYSQL_USER: sqla
+      MYSQL_PASSWORD: sqla
+      MYSQL_ROOT_PASSWORD: sqla
+    command: ["--innodb-buffer-pool-size=64M", "--performance-schema=OFF", "--max-connections=60"]
+    ports:
+      - "127.0.0.1:53308:3306"
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -psqla"]
+      interval: 3s
+      timeout: 5s
+      retries: 40
