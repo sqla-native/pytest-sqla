@@ -10,11 +10,8 @@
 # CI runs it: a skipped real-database suite reporting green proves nothing.
 set -euo pipefail
 
-export SQLA_TEST_POSTGRES_PSYCOPG_URL="postgresql+psycopg://sqla:sqla@127.0.0.1:55434/sqla"
-export SQLA_TEST_POSTGRES_ASYNCPG_URL="postgresql+asyncpg://sqla:sqla@127.0.0.1:55434/sqla"
-export SQLA_TEST_MYSQL_PYMYSQL_URL="mysql+pymysql://sqla:sqla@127.0.0.1:53308/sqla"
-export SQLA_TEST_MYSQL_AIOMYSQL_URL="mysql+aiomysql://sqla:sqla@127.0.0.1:53308/sqla"
-export SQLA_TEST_MYSQL_ASYNCMY_URL="mysql+asyncmy://sqla:sqla@127.0.0.1:53308/sqla"
+# shellcheck source=scripts/local-databases.env
+source "$(dirname "$0")/local-databases.env"
 export SQLA_TEST_REQUIRE_ALL="${SQLA_TEST_REQUIRE_ALL:-1}"
 
 # `python` is not always on PATH outside an activated virtualenv or CI, and a

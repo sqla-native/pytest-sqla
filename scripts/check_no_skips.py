@@ -6,18 +6,21 @@ not there. The integration conftest already fails instead of skipping when
 as an ``importorskip`` or a ``skipif`` added later.
 
     python scripts/check_no_skips.py tests/integration -v
+    coverage run scripts/check_no_skips.py -q    # the whole suite, measured
 
-Every argument is passed to pytest. The exit code is pytest's, or 1 when
-pytest passed but something skipped.
+Every argument is passed to pytest, which runs in this process so that
+coverage can measure it. The exit code is pytest's, or 1 when pytest passed
+but something skipped.
 """
 
 from __future__ import annotations
 
-import subprocess
 import sys
 import tempfile
 import xml.etree.ElementTree as ElementTree
 from pathlib import Path
+
+import pytest
 
 
 def skipped_tests(report: Path) -> list[str]:
@@ -33,8 +36,7 @@ def skipped_tests(report: Path) -> list[str]:
 def main(arguments: list[str]) -> int:
     with tempfile.TemporaryDirectory() as tmp:
         report = Path(tmp) / "junit.xml"
-        command = [sys.executable, "-m", "pytest", f"--junitxml={report}", *arguments]
-        code = subprocess.run(command, check=False).returncode
+        code = int(pytest.main([f"--junitxml={report}", *arguments]))
         skipped = skipped_tests(report) if report.exists() else []
     if skipped:
         print(f"\n{len(skipped)} test(s) skipped; this run proves nothing about them:")
