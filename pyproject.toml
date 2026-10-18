@@ -1,0 +1,142 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "pytest-sqla"
+version = "0.0.1"
+description = "Per-test SQLAlchemy 2.x sessions that roll back, sync and async, for pytest"
+readme = "README.md"
+authors = [{ name = "Rodrigo Nogueira", email = "rodrigo.b.nogueira@gmail.com" }]
+license = { text = "MIT" }
+keywords = [
+    "sqlalchemy",
+    "pytest",
+    "fixtures",
+    "transaction",
+    "rollback",
+    "savepoint",
+    "asyncio",
+    "testing",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Framework :: AsyncIO",
+    "Framework :: Pytest",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Database",
+    "Topic :: Software Development :: Testing",
+    "Typing :: Typed",
+]
+requires-python = ">=3.10"
+
+# Constitution section 6: exactly TWO runtime dependencies. pytest-asyncio and
+# greenlet are an extra, never a dependency: a sync-only suite must install and
+# run without either.
+dependencies = ["sqlalchemy>=2.0", "pytest>=8.2"]
+
+[project.optional-dependencies]
+# pytest-asyncio 1.0 and 1.1 were measured running a test on a different loop
+# than its own loop scope's fixtures. SQLAlchemy 2.1 no longer installs greenlet,
+# which its asyncio extension cannot import without.
+asyncio = ["pytest-asyncio>=1.2", "sqlalchemy[asyncio]>=2.0"]
+
+[project.urls]
+Homepage = "https://github.com/sqla-native/pytest-sqla"
+Repository = "https://github.com/sqla-native/pytest-sqla"
+Changelog = "https://github.com/sqla-native/pytest-sqla/blob/main/CHANGELOG.md"
+
+[project.entry-points.pytest11]
+sqla = "pytest_sqla.plugin"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.2",
+    "pytest-asyncio>=1.2",
+    "pytest-xdist>=3.5",
+    "anyio>=4.4",
+    "aiosqlite>=0.20",
+    "greenlet>=3.0",
+    "coverage[toml]>=7.10",
+    "complexipy>=6.0",
+    "mypy>=1.9",
+    "ruff>=0.4",
+    # Drivers for the gated real-database suite. Dev-only: the production
+    # closure is still SQLAlchemy and pytest.
+    "psycopg[binary]>=3.1",
+    "asyncpg>=0.29",
+    "pymysql>=1.1",
+    "aiomysql>=0.2",
+    "asyncmy>=0.2.9",
+    # MySQL 8's caching_sha2_password over plain TCP, for pymysql and aiomysql.
+    "cryptography>=42",
+    "build>=1.0",
+    "twine>=5.0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/pytest_sqla"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "strict"
+asyncio_default_fixture_loop_scope = "function"
+filterwarnings = ["error"]
+
+[tool.coverage.run]
+branch = true
+source = ["pytest_sqla"]
+# coverage 7.15.3+ picks the sys.monitoring core by default on Python 3.14, and
+# that core cannot record dynamic contexts: every switch_context() then warns,
+# which filterwarnings = error turns into an error per test. This project never
+# uses contexts (never add --cov-context), and the C tracer is what every other
+# supported version runs, so pin it and keep 3.14 identical to the rest. A
+# non-empty COVERAGE_CORE in the environment still overrides this.
+core = "ctrace"
+
+[tool.coverage.report]
+# Constitution section 8: the 100% bar governs src/pytest_sqla only, measured
+# over the whole suite including the real-database layer (see TESTING.md).
+fail_under = 100
+show_missing = true
+exclude_also = [
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+    "@overload",
+]
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF", "ANN", "PT"]
+ignore = ["ANN401"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["ANN"]
+# Constitution section 9: examples are illustrative and run lighter rules.
+# B008 fires on `Depends(...)` in a parameter default, which is FastAPI's
+# documented idiom rather than the bug the rule is looking for.
+"examples/*" = ["ANN", "B008"]
+"scripts/*" = ["ANN"]
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+files = ["src/pytest_sqla"]
+
+# Mutation testing is an occasional, targeted, LOCAL audit - never a per-PR gate
+# and never in CI. Scope every run to the file whose logic you reworked:
+#   mutmut run --max-children 2 "src.pytest_sqla._isolation.*"
+[tool.mutmut]
+source_paths = ["src/pytest_sqla"]
+pytest_add_cli_args_test_selection = ["tests"]
+pytest_add_cli_args = ["-x", "-q", "--no-header", "-p", "no:cacheprovider"]
