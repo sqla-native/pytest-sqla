@@ -131,7 +131,9 @@ def read_settings(config: pytest.Config) -> Settings:
     url = _configured_url(config, URL_ORIGIN)
     async_url = _configured_url(config, ASYNC_URL_ORIGIN)
     if url is not None and async_url is not None:
-        _require_same_database(url.url, async_url.url, pytest.UsageError)
+        mismatch = _mismatch(url.url, async_url.url, (url.source, async_url.source))
+        if mismatch is not None:
+            raise pytest.UsageError(mismatch)
     return Settings(
         url=url,
         async_url=async_url,
@@ -210,19 +212,22 @@ def _identity(url: URL) -> tuple[object, ...]:
     return (family, url.host, port, url.database, url.username)
 
 
-def _require_same_database(
-    url: URL, async_url: URL, error: type[pytest.UsageError] | None = None
-) -> None:
-    """Backend, host, port, database and user must match; the driver may differ."""
+def _mismatch(url: URL, async_url: URL, sources: tuple[str, str] | None = None) -> str | None:
+    """Why the two URLs name different databases, or None when they name one.
+
+    Backend, host, port, database and user must match; the driver may differ.
+    The sources, when known, show the usual cause: a database URL set in the
+    environment for CI, and an async URL still coming from the ini file.
+    """
     if _identity(url) == _identity(async_url):
-        return
-    message = (
+        return None
+    one, other = render(url), render(async_url)
+    if sources is not None:
+        one, other = f"{one} (from {sources[0]})", f"{other} (from {sources[1]})"
+    return (
         "pytest-sqla: sqla_url and sqla_async_url must point at the same database, but one "
-        f"is {render(url)} and the other {render(async_url)}."
+        f"is {one} and the other {other}."
     )
-    if error is not None:
-        raise error(message)
-    pytest.fail(message, pytrace=False)
 
 
 @dataclass(frozen=True)
@@ -255,8 +260,9 @@ class Targets:
 def resolve_targets(sync_value: object, async_value: object, settings: Settings) -> Targets:
     sync = _fixture_url(sync_value, "sqla_url")
     asynchronous = _fixture_url(async_value, "sqla_async_url")
-    if sync is not None and asynchronous is not None:
-        _require_same_database(sync, asynchronous)
+    mismatch = None if sync is None or asynchronous is None else _mismatch(sync, asynchronous)
+    if mismatch is not None:
+        pytest.fail(mismatch, pytrace=False)
     async_setting = "sqla_url" if asynchronous == sync else "sqla_async_url"
     memory = any(_sqlite.is_plain_memory(url) for url in (sync, asynchronous) if url is not None)
     sync = _effective(sync, settings)

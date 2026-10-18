@@ -69,8 +69,6 @@ without. anyio users already have anyio through Starlette, so they need
 [tool.pytest.ini_options]
 sqla_url = "sqlite://"
 sqla_metadata = "app.models:Base"
-asyncio_mode = "strict"
-asyncio_default_fixture_loop_scope = "function"
 ```
 
 ```python
@@ -85,22 +83,46 @@ def test_commits_are_rolled_back(sqla_session):
     assert sqla_session.scalar(select(func.count()).select_from(User)) == 1
 
 
-async def test_async_too(sqla_async_session):  # with @pytest.mark.asyncio in strict mode
+def test_and_the_next_test_starts_clean(sqla_session):
+    assert sqla_session.scalar(select(func.count()).select_from(User)) == 0
+```
+
+The tables in `app.models:Base` are created before the first database test and
+dropped after the last one. For the async fixtures, install the `asyncio` extra
+and give them an async driver:
+
+```toml
+[tool.pytest.ini_options]
+sqla_url = "sqlite://"
+sqla_async_url = "sqlite+aiosqlite://"  # the same in-memory database; needs aiosqlite
+sqla_metadata = "app.models:Base"
+asyncio_mode = "strict"
+asyncio_default_fixture_loop_scope = "function"
+```
+
+```python
+import pytest
+
+
+@pytest.mark.asyncio
+async def test_async_commits_are_rolled_back_too(sqla_async_session):
     sqla_async_session.add(User(email="ada@example.com"))
     await sqla_async_session.commit()
 ```
 
-The tables in `app.models:Base` are created before the first database test and
-dropped after the last one. In CI, point the same tests at a real server:
+In CI, point the same tests at a real server through the environment, which
+takes precedence over the ini file:
 
 ```yaml
 env:
   PYTEST_SQLA_URL: postgresql+psycopg://app:app@localhost:5432/app_test
+  PYTEST_SQLA_ASYNC_URL: postgresql+psycopg://app:app@localhost:5432/app_test
 ```
 
-`postgresql+psycopg` serves both the sync and the async fixtures. With a sync
-driver that has no async twin, such as pymysql, also set `PYTEST_SQLA_ASYNC_URL`
-to the same database through an async one, such as `mysql+aiomysql`.
+`postgresql+psycopg` serves both the sync and the async fixtures. Set the async
+variable whenever the ini file sets `sqla_async_url`: the two URLs must name the
+same database, and pytest-sqla refuses to run with one on PostgreSQL and the
+other still on SQLite. With MySQL, use `mysql+pymysql` and `mysql+aiomysql`.
 
 ## FastAPI
 
@@ -216,7 +238,9 @@ replaces the computed value, as with any pytest fixture.
 `connect_args`, `json_serializer`, `execution_options` and so on. It refuses
 what would make a rollback impossible (`isolation_level="AUTOCOMMIT"`,
 sqlite3's `autocommit=True`) and, for async engines, `poolclass`, which
-pytest-sqla picks per event loop. `sqla_session_options` reaches the
+pytest-sqla picks per event loop. The same options reach the sync and the
+async engines, so keep driver-specific `connect_args` to a URL whose driver
+serves both. `sqla_session_options` reaches the
 sessionmakers, so the test sessions can behave like the application's:
 `expire_on_commit`, `autoflush`, `info`, or `class_` for sqlmodel's `Session`
 and `AsyncSession`. It refuses `bind`, `binds` and `join_transaction_mode`.

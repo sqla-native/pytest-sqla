@@ -279,8 +279,8 @@ def test_the_two_urls_must_name_the_same_database(project: Project) -> None:
     result.stderr.fnmatch_lines(
         [
             "*pytest-sqla: sqla_url and sqla_async_url must point at the same database, but "
-            "one is postgresql+psycopg://ada:***@one/app and the other "
-            "postgresql+asyncpg://ada:***@two/app."
+            "one is postgresql+psycopg://ada:***@one/app (from sqla_url) and the other "
+            "postgresql+asyncpg://ada:***@two/app (from --sqla-async-url)."
         ]
     )
     assert "s3cret" not in result.stderr.str()
