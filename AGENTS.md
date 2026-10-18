@@ -46,8 +46,7 @@ docker compose down -v
 ```
 
 Run them before any PR that touches `_isolation.py`, `_schema.py`,
-`_asyncio.py` or `_engines.py`. This machine may be short on RAM: run one
-heavy thing at a time, and stop the containers when you are done.
+`_asyncio.py` or `_engines.py`, and stop the containers when you are done.
 
 ## Measure, don't reason from memory
 

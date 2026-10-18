@@ -4,8 +4,11 @@ Two applications in the shapes pytest-sqla is for, with tests that assert its
 promise against them. CI runs them on SQLite, PostgreSQL and MySQL; they are
 validation, not decoration.
 
+From the repository root, so the examples test this checkout rather than a
+pytest-sqla from PyPI:
+
 ```bash
-pip install -r requirements.txt
+pip install -e . -r examples/requirements.txt
 pytest examples -q
 ```
 

@@ -6,8 +6,8 @@
 #
 # The default test run needs none of this: those specs skip unless their
 # environment variables are set, so a fork clones and runs green with no Docker.
-# The host ports differ from queryspy's (55432, 53306) so both projects can
-# run their databases at once, and MySQL is trimmed to fit a small machine.
+# Non-default host ports, so they do not collide with a PostgreSQL or MySQL
+# already listening on 5432 or 3306; MySQL is trimmed to run in little memory.
 name: pytest-sqla
 services:
   postgres:

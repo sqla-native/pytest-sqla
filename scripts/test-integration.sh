@@ -3,7 +3,9 @@
 #
 #   docker compose up -d --wait
 #   ./scripts/test-integration.sh            # tests/integration, -v
-#   ./scripts/test-integration.sh -x -q      # extra pytest arguments pass through
+#   ./scripts/test-integration.sh -x -q      # tests/integration, with these arguments
+#   ./scripts/test-integration.sh tests/integration/test_xdist_backends.py -q
+#                                            # an argument naming a path replaces the target
 #   docker compose down -v
 #
 # SQLA_TEST_REQUIRE_ALL=1 turns a missing URL or driver into a failure, the way
@@ -26,6 +28,13 @@ if [ -z "$PYTHON" ]; then
 fi
 
 if [ "$#" -eq 0 ]; then
-  set -- tests/integration -v
+  set -- -v
 fi
-exec "$PYTHON" scripts/check_no_skips.py "$@"
+target=tests/integration
+for argument in "$@"; do
+  case "$argument" in
+    -*) ;;
+    *) if [ -e "${argument%%::*}" ]; then target=; fi ;;
+  esac
+done
+exec "$PYTHON" scripts/check_no_skips.py ${target:+"$target"} "$@"

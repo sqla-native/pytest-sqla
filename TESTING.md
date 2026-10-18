@@ -51,12 +51,14 @@ inertness check use a subprocess.
 
 - `tests/sync/` needs nothing async: configuration and precedence, every
   usage error, sync isolation and breaches, the schema and its locks, SQLite,
-  the engine and session options, the public surface, and what a sync-only
-  install reports. The sync-only CI job runs exactly this directory with no
-  pytest-asyncio, anyio, greenlet or aiosqlite installed.
+  the engine and session options, the public surface, what a sync-only
+  install reports, and the README's Alembic recipe, run as its code block is
+  written. The sync-only CI job runs exactly this directory with no
+  pytest-asyncio, anyio, greenlet, aiosqlite or alembic installed.
 - `tests/test_isolation_async.py`, `test_loops.py`, `test_async_sqlite.py`:
   the async family under pytest-asyncio strict and auto mode, every loop
-  scope, anyio, the loop guard, NullPool and per-loop pools.
+  scope, anyio and both plugin orders, the loop guard, tasks a test leaves
+  running, NullPool and per-loop pools.
 - `tests/test_xdist.py`: per-worker SQLite files, per-process memory databases.
 
 Controls keep the suite honest: `tests/sync/test_sqlite.py` shows the SQLite
@@ -80,12 +82,14 @@ docker compose down -v
 ```
 
 PostgreSQL 17 and MySQL 8.4 from `compose.yaml` (host ports 55434 and 53308,
-so queryspy's databases can run at the same time), through psycopg (sync and
+so a server already on 5432 or 3306 is untouched), through psycopg (sync and
 async), asyncpg, pymysql, aiomysql and asyncmy. The same behaviours as layer
 1, plus what only real servers show: transactional DDL on PostgreSQL, implicit
-commits on MySQL, cross-loop breakage on asyncpg, advisory locks and
-`GET_LOCK` timing out, a leaked transaction blocking the drop, and pytest-xdist
-workers sharing one database.
+commits and deadlocks on MySQL, session state that ROLLBACK keeps, cross-loop
+breakage on asyncpg, advisory locks and `GET_LOCK` timing out, a leaked
+transaction blocking the drop and a live run blocking a recreation, a task left
+running on every async driver, the Alembic recipe with a password that needs
+escaping, and pytest-xdist workers sharing one database.
 
 These specs skip when their URL or driver is missing, so a clone stays green.
 **CI fails if they skip**: `SQLA_TEST_REQUIRE_ALL=1` turns each such skip into
@@ -109,7 +113,7 @@ to fit a change: restructure the code so the branch does not exist.
 ## 5. Examples
 
 ```bash
-pip install -r examples/requirements.txt
+pip install -e . -r examples/requirements.txt   # from the repository root
 pytest examples -q
 ```
 
@@ -123,8 +127,9 @@ runs them on SQLite, then on PostgreSQL and MySQL by setting
 ## 6. Packaging
 
 ```bash
-python scripts/check_packed_consumer.py     # wheel -> clean venv -> real use
-python scripts/audit_production_surface.py  # pip-audit the published closure
+python -m build && twine check --strict dist/*   # what PyPI will render
+python scripts/check_packed_consumer.py           # wheel -> clean venv -> real use
+python scripts/audit_production_surface.py        # pip-audit the published closure
 ```
 
 The first builds the wheel and installs it into a throwaway virtualenv with no
@@ -149,8 +154,8 @@ mutmut show <mutant>
 
 Scope every run to the one or two files whose logic you reworked, usually
 `_isolation.py` or `_schema.py`; the runner re-executes the suite per mutant.
-`--max-children 2` is deliberate, and two concurrent runs are never acceptable
-on a machine short of RAM. `mutmut results` lists only survivors.
+`--max-children 2` is deliberate, and so is never running two at once: each
+mutant re-runs the suite. `mutmut results` lists only survivors.
 
 **Verify a kill without re-running mutmut**: hand-apply the surviving
 mutation, run the plain suite, confirm your new test fails, then
