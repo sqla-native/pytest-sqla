@@ -43,12 +43,12 @@ jobs:
           --health-cmd="mysqladmin ping -h 127.0.0.1 -psqla"
           --health-interval=3s --health-timeout=5s --health-retries=40
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
-      - uses: astral-sh/setup-uv@v5
-      - uses: actions/setup-python@v5
+      - uses: astral-sh/setup-uv@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
 
@@ -89,7 +89,7 @@ jobs:
 
       - name: Restore base branch metrics
         if: github.event_name == 'pull_request'
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v6
         with:
           path: ci-data
           key: ci-data-${{ github.base_ref }}-
@@ -101,7 +101,7 @@ jobs:
         if: >-
           github.event_name == 'pull_request'
           && github.event.pull_request.head.repo.full_name == github.repository
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         with:
           script: |
             const report = require('./.github/scripts/quality-report.js');
@@ -116,7 +116,7 @@ jobs:
           cp test-duration-ms.txt ci-data/test-duration-ms.txt
 
       - if: github.event_name == 'push'
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v6
         with:
           path: ci-data
           key: ci-data-${{ github.ref_name }}-${{ github.sha }}
@@ -150,9 +150,9 @@ jobs:
       matrix:
         python: ["3.10", "3.11", "3.12", "3.13", "3.14"]
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python }}
       - run: uv pip install --system -e . --group dev
@@ -190,9 +190,9 @@ jobs:
           --health-cmd="mysqladmin ping -h 127.0.0.1 -psqla"
           --health-interval=3s --health-timeout=5s --health-retries=40
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.10"
       - run: uv pip install --system -e . --group dev
@@ -220,9 +220,9 @@ jobs:
     # Every other job on Python 3.11+ resolves SQLAlchemy 2.1, and the floor
     # job pins 2.0.0. This keeps the newest 2.0.x proven too, examples included.
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - run: uv pip install --system -e . --group dev "sqlalchemy[asyncio]>=2.0,<2.1"
@@ -239,9 +239,9 @@ jobs:
     # every sync fixture must work, and an async fixture must fail with
     # pytest-sqla's own message rather than an ImportError.
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.13"
       - run: uv pip install --system . pytest
@@ -296,9 +296,9 @@ jobs:
       # A missing URL or driver fails instead of skipping.
       SQLA_TEST_REQUIRE_ALL: "1"
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - run: uv pip install --system -e . --group dev
@@ -328,9 +328,9 @@ jobs:
     # The examples are validation, not decoration: each one's second test
     # asserts the first test's commits were rolled back.
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - run: uv pip install --system -e . --group dev
@@ -341,9 +341,9 @@ jobs:
     name: Packaging and supply chain
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - run: uv pip install --system -e . --group dev
