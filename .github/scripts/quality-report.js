@@ -37,7 +37,7 @@ function worstComplexity(report) {
   }, 0);
 }
 
-module.exports = async ({ github, context }) => {
+module.exports = async ({ github, context, core }) => {
   const coverage = readJson('coverage.json');
   const complexity = readJson('complexity.json');
   const durationMs = readNumber('test-duration-ms.txt');
@@ -98,12 +98,19 @@ module.exports = async ({ github, context }) => {
   const { owner, repo } = context.repo;
   const issue_number = context.payload.pull_request.number;
 
-  const existing = await github.rest.issues.listComments({ owner, repo, issue_number });
-  const previous = existing.data.find((comment) => comment.body.includes(MARKER));
+  try {
+    const existing = await github.rest.issues.listComments({ owner, repo, issue_number });
+    const previous = existing.data.find((comment) => comment.body.includes(MARKER));
 
-  if (previous) {
-    await github.rest.issues.updateComment({ owner, repo, comment_id: previous.id, body });
-  } else {
-    await github.rest.issues.createComment({ owner, repo, issue_number, body });
+    if (previous) {
+      await github.rest.issues.updateComment({ owner, repo, comment_id: previous.id, body });
+    } else {
+      await github.rest.issues.createComment({ owner, repo, issue_number, body });
+    }
+  } catch (error) {
+    // A read-only token (a fork's or Dependabot's PR) gets 403 "Resource not
+    // accessible by integration"; the report is a courtesy, not a gate.
+    if (error.status !== 403) throw error;
+    core.warning(`Quality report not posted: ${error.message}`);
   }
 };

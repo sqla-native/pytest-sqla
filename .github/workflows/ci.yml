@@ -7,12 +7,16 @@ on:
 
 permissions:
   contents: read
-  pull-requests: write
 
 jobs:
   quality:
     name: Tests, coverage, complexity (Python 3.12)
     runs-on: ubuntu-latest
+    # Only this job comments on the PR. A pull request from a fork, or from
+    # Dependabot, gets a read-only token whatever this says.
+    permissions:
+      contents: read
+      pull-requests: write
     # The coverage gate runs the whole suite against real servers: the
     # PostgreSQL and MySQL branches of the schema locks and the MySQL clean-up
     # cannot run on SQLite, and 100% measured without them would be a lie.
@@ -91,8 +95,12 @@ jobs:
           key: ci-data-${{ github.base_ref }}-
           restore-keys: ci-data-${{ github.base_ref }}-
 
+      # A fork's token cannot comment (403), and this job carries the coverage
+      # gate, so the report never decides the job's result.
       - name: PR quality report
-        if: github.event_name == 'pull_request'
+        if: >-
+          github.event_name == 'pull_request'
+          && github.event.pull_request.head.repo.full_name == github.repository
         uses: actions/github-script@v7
         with:
           script: |
@@ -154,11 +162,11 @@ jobs:
   floor:
     name: Oldest supported versions
     runs-on: ubuntu-latest
-    # The declared floors: sqlalchemy>=2.0, pytest>=8.2 and, in the asyncio
-    # extra, pytest-asyncio>=1.2. pytest-asyncio 1.0 and 1.1 were measured
-    # running a test on another loop than its own scope's fixtures; 1.2 is the
-    # first that holds, and pytest 8.2 is its own floor. The loop handling is
-    # what the floor is about, so the real servers run here too.
+    # The declared floors: Python 3.10, sqlalchemy>=2.0, pytest>=8.2 and, in
+    # the asyncio extra, pytest-asyncio>=1.2. pytest-asyncio 1.0 and 1.1 were
+    # measured running a test on another loop than its own scope's fixtures;
+    # 1.2 is the first that holds, and pytest 8.2 is its own floor. The loop
+    # handling is what the floor is about, so the real servers run here too.
     services:
       postgres:
         image: postgres:17-alpine
@@ -186,7 +194,7 @@ jobs:
       - uses: astral-sh/setup-uv@v5
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.10"
       - run: uv pip install --system -e . --group dev
       - run: uv pip install --system "sqlalchemy[asyncio]==2.0.0" "pytest==8.2.0" "pytest-asyncio==1.2.0"
       - run: |
@@ -343,7 +351,7 @@ jobs:
       - name: Build and check distributions
         run: |
           python -m build
-          twine check dist/*
+          twine check --strict dist/*
 
       - name: Consumer smoke test against the built wheel
         run: python scripts/check_packed_consumer.py
