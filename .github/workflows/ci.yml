@@ -74,7 +74,7 @@ jobs:
           coverage report
           coverage json -o coverage.json
 
-      # Constitution section 8: cognitive complexity <= 15 per function.
+      # Constitution section 7: cognitive complexity <= 15 per function.
       # complexipy is a native binary with no dependency on a type checker, so
       # this gate can never be held hostage by a parser's release cycle.
       - name: Cognitive complexity gate
