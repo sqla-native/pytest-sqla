@@ -38,8 +38,9 @@ async def anyio_client(
 
 
 async def test_a_duplicate_email_is_a_conflict(anyio_client: AsyncClient) -> None:
-    assert (await anyio_client.post("/users", params={"email": "ada@example.com"})).status_code == 201
-    assert (await anyio_client.post("/users", params={"email": "ada@example.com"})).status_code == 409
+    ada = {"email": "ada@example.com"}
+    assert (await anyio_client.post("/users", params=ada)).status_code == 201
+    assert (await anyio_client.post("/users", params=ada)).status_code == 409
     assert (await anyio_client.get("/users/count")).json() == {"count": 1}
 
 

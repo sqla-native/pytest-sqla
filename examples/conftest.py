@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import pytest
-
 from fastapi_app.app import Base as ApiBase
 from sync_app.services import Base as ServicesBase
 

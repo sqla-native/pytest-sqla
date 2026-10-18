@@ -58,4 +58,6 @@ def transfer(sessions: sessionmaker[Session], source: str, target: str, amount: 
 
 
 def balances(session: Session) -> dict[str, int]:
-    return {owner: balance for owner, balance in session.execute(select(Account.owner, Account.balance))}
+    return {
+        owner: balance for owner, balance in session.execute(select(Account.owner, Account.balance))
+    }

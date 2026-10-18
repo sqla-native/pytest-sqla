@@ -42,7 +42,9 @@ app = FastAPI()
 
 
 @app.post("/users", status_code=201)
-async def create_user(email: str, session: AsyncSession = Depends(get_session)) -> dict[str, object]:
+async def create_user(
+    email: str, session: AsyncSession = Depends(get_session)
+) -> dict[str, object]:
     user = User(email=email)
     session.add(user)
     try:
