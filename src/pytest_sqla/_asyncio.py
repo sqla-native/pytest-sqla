@@ -6,9 +6,9 @@ its caching scope, and a test's loop from its ``asyncio`` marker or
 ``asyncio_default_test_loop_scope``. Nothing compares the two, so a fixture
 and the test that uses it can run on different loops. Measured on SQLAlchemy
 2.1.5 with a connection opened on one loop and used on another: asyncpg
-0.32.0, aiomysql 0.3.2 and asyncmy 0.2.16 raise "attached to a different loop"
-and leave the connection unusable; psycopg 3.3 async and aiosqlite 0.22 happen
-to survive.
+0.32.0, aiomysql 0.3.2 and asyncmy 0.2.16 raise "attached to a different
+loop", and asyncpg's connection is unusable afterwards; psycopg 3.3 async and
+aiosqlite 0.22 happen to survive (tests/integration pins all of it).
 
 **The design.** The public async fixtures are synchronous dispatchers. Each
 reads the test item and requests an internal fixture that runs on the test's

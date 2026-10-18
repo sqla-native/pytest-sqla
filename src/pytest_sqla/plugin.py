@@ -307,8 +307,9 @@ def _sqla_async_engine_function(
     """Serves per-test loops and anyio tests: NullPool, so no connection outlives its loop.
 
     Each test opens and closes its own DBAPI connection on its own loop. The
-    measured extra cost per test against a pool, on localhost Docker: 4.0 to
-    5.8 ms on PostgreSQL, 1.2 to 1.6 ms on MySQL.
+    extra cost per test against a pool, measured with scripts/benchmark.py on
+    localhost Docker: 3.9 ms (psycopg) to 5.5 ms (asyncpg) on PostgreSQL, and
+    1.2 ms on MySQL (aiomysql, asyncmy).
     """
     assert _sqla_urls.asynchronous is not None, "the dispatcher checked the URL"
     engine = async_engine(_sqla_urls.asynchronous, sqla_engine_options, pooled=False)

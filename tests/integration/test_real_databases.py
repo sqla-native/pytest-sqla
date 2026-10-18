@@ -10,15 +10,17 @@ connection crosses event loops. Each spec runs an inner pytest session with
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 
 import pytest
 from sqlalchemy import create_engine, func, select, text
-from sqlalchemy.engine import make_url
+from sqlalchemy.engine import Engine, make_url
 from sqlalchemy.pool import NullPool
 
 from tests.helpers import MODELS, Project
 from tests.integration.conftest import Database, sync_twin
+from tests.sync.test_recipe import after_an_app_rollback, run_probe
 
 ANYIO = """
 import pytest
@@ -429,7 +431,7 @@ def test_an_async_committed_connection_is_reported(
 def test_a_loop_mismatch_leaves_the_connection_usable(
     project: Project, async_database: Database
 ) -> None:
-    """asyncpg, aiomysql and asyncmy break a connection used from another loop."""
+    """The guard stops the call before asyncpg, which a cross-loop call breaks, sees it."""
     result = inner(
         project,
         async_database,
@@ -507,3 +509,61 @@ def test_a_thread_without_a_loop_is_stopped_by_the_guard(
         """,
     )
     result.assert_outcomes(passed=1)
+
+
+# -------------------------------------------------------------- the controls
+
+
+def test_the_default_join_mode_leaks_on_real_servers_too(sync_database: Database) -> None:
+    """Why create_savepoint: plain SQLAlchemy, no plugin, see tests/sync/test_recipe.py."""
+    engine = create_engine(sync_database.url, poolclass=NullPool)
+
+    def create_savepoint(engine: Engine) -> tuple[int, int]:
+        return after_an_app_rollback(engine, join_transaction_mode="create_savepoint")
+
+    try:
+        assert run_probe(engine, after_an_app_rollback) == (0, 1)
+        assert run_probe(engine, create_savepoint) == (1, 0)
+    finally:
+        engine.dispose()
+
+
+def test_without_the_guard_crossing_loops_fails(async_database: Database) -> None:
+    """Why the loop guard: plain SQLAlchemy, a connection used from a second loop.
+
+    Measured: asyncpg, aiomysql and asyncmy raise "attached to a different
+    loop", and asyncpg's connection is unusable afterwards. psycopg happens to
+    survive, which is why the guard checks every driver alike.
+    """
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    engine = create_async_engine(async_database.url, poolclass=NullPool)
+    owner, other = asyncio.new_event_loop(), asyncio.new_event_loop()
+    connection = owner.run_until_complete(engine.connect())
+    owner.run_until_complete(connection.execute(text("SELECT 1")))
+    try:
+        crossed = None
+        try:
+            other.run_until_complete(connection.execute(text("SELECT 2")))
+        except RuntimeError as error:
+            crossed = str(error)
+        usable = True
+        try:
+            owner.run_until_complete(connection.execute(text("SELECT 3")))
+        except Exception:
+            usable = False
+    finally:
+        owner.run_until_complete(connection.invalidate())
+        owner.run_until_complete(connection.close())
+        owner.run_until_complete(engine.dispose())
+        for loop in (other, owner):
+            loop.run_until_complete(loop.shutdown_asyncgens())
+            loop.close()
+    name = async_database.backend.name
+    if name == "postgresql+psycopg":
+        assert crossed is None
+        assert usable
+    else:
+        assert crossed is not None
+        assert "attached to a different loop" in crossed
+        assert usable is (name != "postgresql+asyncpg")

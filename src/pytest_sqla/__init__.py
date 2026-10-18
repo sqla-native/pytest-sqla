@@ -50,5 +50,5 @@ class LoopMismatchError(PytestSqlaError, RuntimeError):
     """An async connection was used from an event loop it does not belong to.
 
     Raised before the driver sees the statement, which keeps the connection
-    usable: asyncpg, aiomysql and asyncmy are left broken by a cross-loop call.
+    usable: asyncpg's connection is left broken by a cross-loop call.
     """

@@ -27,7 +27,7 @@ from tests.helpers import table_names
 REQUIRE_ALL = os.environ.get("SQLA_TEST_REQUIRE_ALL") == "1"
 
 # Every table an inner run may leave behind when a test breaks it on purpose.
-TABLES = ("zz_broken", "note", "user_account", "pytest_sqla", "it_extra")
+TABLES = ("zz_broken", "note", "user_account", "pytest_sqla", "it_extra", "recipe_item")
 
 
 @dataclass(frozen=True)
