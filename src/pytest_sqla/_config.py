@@ -242,6 +242,9 @@ class Targets:
     """The sqlite3 filename to hold open for the session, for shared memory."""
     worker_file: str | None
     """A per-worker SQLite file this run creates and deletes."""
+    disposable: bool
+    """The database is one pytest-sqla made up, a memdb name or a per-worker
+    file, so it is discarded at the end instead of having its tables dropped."""
 
     @property
     def ddl(self) -> URL | None:
@@ -255,6 +258,7 @@ def resolve_targets(sync_value: object, async_value: object, settings: Settings)
     if sync is not None and asynchronous is not None:
         _require_same_database(sync, asynchronous)
     async_setting = "sqla_url" if asynchronous == sync else "sqla_async_url"
+    memory = any(_sqlite.is_plain_memory(url) for url in (sync, asynchronous) if url is not None)
     sync = _effective(sync, settings)
     asynchronous = _effective(asynchronous, settings)
     connected = [url for url in (sync, asynchronous) if url is not None]
@@ -267,6 +271,7 @@ def resolve_targets(sync_value: object, async_value: object, settings: Settings)
         async_setting=async_setting,
         keeper=_sqlite.keeper_target(shared[0]) if shared else None,
         worker_file=str(files[0].database) if files else None,
+        disposable=memory or bool(files),
     )
 
 

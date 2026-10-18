@@ -227,12 +227,18 @@ def _waited_too_long(plan: Plan, error: DBAPIError | None = None) -> SchemaConfl
 
 
 def _blocked_drop(plan: Plan, error: DBAPIError) -> SchemaConflictError:
+    unread = (
+        " On SQLite, so can a query result a failing test left unread: Python 3.11+ keeps "
+        "its read lock until the result is garbage-collected."
+        if plan.url.get_backend_name() == "sqlite"
+        else ""
+    )
     return SchemaConflictError(
         f"pytest-sqla: could not drop the test schema in {render(plan.url)} within "
         f"{plan.lock_timeout:g} s: another connection still holds a lock on one of its tables. "
         "Some code in this run opened its own connection (for example through the "
-        "application's own engine) and left a transaction open. The driver reported: "
-        f"{error.orig}"
+        f"application's own engine) and left a transaction open.{unread} The driver "
+        f"reported: {error.orig}"
     )
 
 
@@ -285,10 +291,9 @@ def _mysql(connection: Connection, plan: Plan, work: _Work, ending: bool) -> str
 
 
 def _sqlite(connection: Connection, plan: Plan, work: _Work, ending: bool) -> str:
-    # At session end the likely holder is a transaction some test leaked.
-    with _waiting(connection, plan, blocked_drop=ending):
-        transaction = connection.begin()  # BEGIN IMMEDIATE, through the listener
-    with transaction:
+    # BEGIN IMMEDIATE (through the listener) waits for other writers, and
+    # COMMIT for readers. At session end the likely holder is a test's leak.
+    with _waiting(connection, plan, blocked_drop=ending), connection.begin():
         return _do(connection, plan, work, ending)
 
 

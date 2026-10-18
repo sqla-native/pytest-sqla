@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+import sys
 from pathlib import Path
 
 import pytest
@@ -515,10 +516,43 @@ def test_a_leaked_transaction_cannot_hang_the_drop(project: Project, database: s
             f"E *pytest_sqla.SchemaConflictError: pytest-sqla: could not drop the test schema "
             f"in {database} within 0.2 s: another connection still holds a lock on one of its "
             "tables. Some code in this run opened its own connection (for example through the "
-            "application's own engine) and left a transaction open. The driver reported: "
-            "database is locked",
+            "application's own engine) and left a transaction open. On SQLite, so can a query "
+            "result a failing test left unread: Python 3.11+ keeps its read lock until the "
+            "result is garbage-collected. The driver reported: database is locked",
         ]
     )
+
+
+UNREAD_RESULT = """
+from models import User
+
+def test_fails_with_a_result_unread(sqla_session):
+    sqla_session.add_all([User(email=f"{n}@example.com") for n in range(3)])
+    sqla_session.flush()
+    result = sqla_session.execute(User.__table__.select())
+    assert result is None, "a failure while the rows are still unread"
+"""
+
+
+def test_an_unread_result_cannot_block_a_disposable_database(project: Project) -> None:
+    """In-memory and per-worker databases are discarded, never dropped."""
+    project.models()
+    project.ini(sqla_url="sqlite://", sqla_lock_timeout="0.5")
+    project.tests(UNREAD_RESULT)
+    result = project.run()
+    result.assert_outcomes(failed=1)
+
+
+@pytest.mark.skipif(sys.version_info < (3, 11), reason="3.10's rollback resets the statement")
+def test_an_unread_result_holding_a_named_file_is_explained(
+    project: Project, database: str
+) -> None:
+    """Measured: Python 3.11+ keeps the read lock until the result is collected."""
+    project.ini(sqla_lock_timeout="0.5")
+    project.tests(UNREAD_RESULT)
+    result = project.run()
+    result.assert_outcomes(failed=1, errors=1)
+    result.stdout.fnmatch_lines(["*could not drop the test schema*left unread*"])
 
 
 # --------------------------------------------------------- xdist and dialects

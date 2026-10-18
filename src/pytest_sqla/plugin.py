@@ -163,6 +163,12 @@ def sqla_schema(request: pytest.FixtureRequest) -> Iterator[None]:
     dropped by the last one out. Tables pytest-sqla did not create are refused,
     never dropped. With ``sqla_schema = none`` it does nothing. Override it to
     build the schema yourself, for example with Alembic.
+
+    A SQLite database pytest-sqla made up - an in-memory one, or a per-worker
+    file - is discarded at the end instead. On Python 3.11 and later an
+    unread result a failing test left behind keeps a SQLite read lock until it
+    is garbage-collected, and pytest keeps the last failure's traceback, so a
+    DROP there would wait out the lock timeout.
     """
     __tracebackhide__ = True
     settings = _settings(request)
@@ -176,8 +182,9 @@ def sqla_schema(request: pytest.FixtureRequest) -> Iterator[None]:
     plan = _schema_plan(request, settings, url)
     _reported(_schema.prepare, plan)
     yield
-    _reported(_schema.release, plan)
-    if targets.worker_file is not None:
+    if not targets.disposable:
+        _reported(_schema.release, plan)
+    elif targets.worker_file is not None:
         for suffix in ("", "-journal", "-wal", "-shm"):
             Path(targets.worker_file + suffix).unlink(missing_ok=True)
 
