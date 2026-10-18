@@ -557,6 +557,7 @@ databases are on the roadmap).
 can supply it, as a str or a URL:
 
 ```python
+import pytest
 from testcontainers.community.postgres import PostgresContainer
 
 
