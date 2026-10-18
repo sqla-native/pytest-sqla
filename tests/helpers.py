@@ -7,10 +7,13 @@ installed.
 
 from __future__ import annotations
 
+import gc
 import importlib.util
 import sqlite3
 import textwrap
+import warnings
 from collections.abc import Iterable
+from importlib.metadata import version
 from pathlib import Path
 
 import pytest
@@ -18,6 +21,20 @@ from sqlalchemy import create_engine, inspect
 from sqlalchemy.pool import NullPool
 
 HAS_PYTEST_ASYNCIO = importlib.util.find_spec("pytest_asyncio") is not None
+
+
+def _leaks_event_loops() -> bool:
+    """pytest-asyncio before 1.4 leaves an unclosed event loop behind every
+    in-process session: measured with 1.2.0 and 1.3.0, on pytest 8.2 to 9.1,
+    with no pytest-sqla involved. Its socket's ResourceWarning then surfaces in
+    whichever later test the garbage collector happens to run in."""
+    if not HAS_PYTEST_ASYNCIO:
+        return False
+    major, minor = (int(part) for part in version("pytest-asyncio").split(".")[:2])
+    return (major, minor) < (1, 4)
+
+
+LEAKS_EVENT_LOOPS = _leaks_event_loops()
 
 MODELS = """
 from sqlalchemy import ForeignKey, String, func, select
@@ -98,7 +115,12 @@ class Project:
 
     def run(self, *args: str) -> pytest.RunResult:
         self._write_ini()
-        return self.pytester.runpytest(*args)
+        result = self.pytester.runpytest(*args)
+        if LEAKS_EVENT_LOOPS:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", ResourceWarning)
+                gc.collect()
+        return result
 
     def run_subprocess(self, *args: str) -> pytest.RunResult:
         self._write_ini()

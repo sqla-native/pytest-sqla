@@ -410,13 +410,25 @@ def test_a_sync_fixture_refuses_an_async_driver(project: Project) -> None:
     [
         ("sqlite+aiosqlite:///test.db", "aiosqlite", "sqlite"),
         ("mysql+aiomysql://ada@localhost/app", "aiomysql", "mysql+pymysql"),
-        ("mssql+aioodbc://ada@localhost/app", "aioodbc", "mssql+<driver>"),
+        ("fakeasync+aiosqlite:///test.db", "aiosqlite", "fakeasync+<driver>"),
     ],
 )
 def test_a_sync_fixture_suggests_a_sync_driver(
     project: Project, url: str, driver: str, example: str
 ) -> None:
     project.models()
+    project.conftest(
+        """
+        from sqlalchemy.dialects import registry
+        from sqlalchemy.dialects.sqlite.aiosqlite import SQLiteDialect_aiosqlite
+
+        class FakeAsync(SQLiteDialect_aiosqlite):
+            name = "fakeasync"
+            supports_statement_cache = True
+
+        registry.register("fakeasync.aiosqlite", "conftest", "FakeAsync")
+        """
+    )
     project.ini(sqla_url=url)
     project.tests("def test_db(sqla_connection):\n    pass\n")
     result = project.run()
