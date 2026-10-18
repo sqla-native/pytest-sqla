@@ -238,12 +238,14 @@ replaces the computed value, as with any pytest fixture.
 `connect_args`, `json_serializer`, `execution_options` and so on. It refuses
 what would make a rollback impossible (`isolation_level="AUTOCOMMIT"`,
 sqlite3's `autocommit=True`) and, for async engines, `poolclass`, which
-pytest-sqla picks per event loop. The same options reach the sync and the
-async engines, so keep driver-specific `connect_args` to a URL whose driver
-serves both. `sqla_session_options` reaches the
-sessionmakers, so the test sessions can behave like the application's:
-`expire_on_commit`, `autoflush`, `info`, or `class_` for sqlmodel's `Session`
-and `AsyncSession`. It refuses `bind`, `binds` and `join_transaction_mode`.
+pytest-sqla picks per event loop. The same options reach the sync and the async
+engines, so keep driver-specific `connect_args` to a URL whose driver serves
+both.
+
+`sqla_session_options` reaches the sessionmakers, so the test sessions can
+behave like the application's: `expire_on_commit`, `autoflush`, `info`, or
+`class_` for sqlmodel's `Session` and `AsyncSession`. It refuses `bind`,
+`binds` and `join_transaction_mode`.
 
 The metadata can be a `MetaData`, any class whose `.metadata` is one (a
 `DeclarativeBase`, `declarative_base()`, SQLModel), or a list of these:
