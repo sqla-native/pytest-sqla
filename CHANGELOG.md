@@ -6,6 +6,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Python 3.15**, in the test matrix with 3.11 to 3.14.
+
+### Removed
+
+- **Python 3.10**, which reached its end of life on 2026-10-01.
+  `requires-python` is now `>=3.11`, so pip keeps a Python 3.10 project on
+  pytest-sqla 0.0.1.
+
 ## [0.0.1] - 2026-10-18
 
 Initial release.

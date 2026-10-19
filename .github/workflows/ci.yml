@@ -141,14 +141,13 @@ jobs:
   test-matrix:
     name: Python ${{ matrix.python }}
     runs-on: ubuntu-latest
-    # The hermetic suite on every supported Python. 3.10 resolves SQLAlchemy
-    # 2.0.x by itself, because SQLAlchemy 2.1 requires Python 3.11; the others
-    # get 2.1. The real-database specs skip here, which is right for this job:
-    # the quality and integration jobs run them, and fail if they skip.
+    # The hermetic suite on every supported Python, on SQLAlchemy 2.1. The
+    # real-database specs skip here, which is right for this job: the quality
+    # and integration jobs run them, and fail if they skip.
     strategy:
       fail-fast: false
       matrix:
-        python: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+        python: ["3.11", "3.12", "3.13", "3.14", "3.15"]
     steps:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v7
@@ -162,7 +161,7 @@ jobs:
   floor:
     name: Oldest supported versions
     runs-on: ubuntu-latest
-    # The declared floors: Python 3.10, sqlalchemy>=2.0, pytest>=8.2 and, in
+    # The declared floors: Python 3.11, sqlalchemy>=2.0, pytest>=8.2 and, in
     # the asyncio extra, pytest-asyncio>=1.2. pytest-asyncio 1.0 and 1.1 were
     # measured running a test on another loop than its own scope's fixtures;
     # 1.2 is the first that holds, and pytest 8.2 is its own floor. The loop
@@ -194,7 +193,7 @@ jobs:
       - uses: astral-sh/setup-uv@v7
       - uses: actions/setup-python@v7
         with:
-          python-version: "3.10"
+          python-version: "3.11"
       - run: uv pip install --system -e . --group dev
       - run: uv pip install --system "sqlalchemy[asyncio]==2.0.0" "pytest==8.2.0" "pytest-asyncio==1.2.0"
       - run: |
@@ -217,8 +216,8 @@ jobs:
   sqlalchemy-2-0:
     name: Newest SQLAlchemy 2.0
     runs-on: ubuntu-latest
-    # Every other job on Python 3.11+ resolves SQLAlchemy 2.1, and the floor
-    # job pins 2.0.0. This keeps the newest 2.0.x proven too, examples included.
+    # Every other job resolves SQLAlchemy 2.1, and the floor job pins 2.0.0.
+    # This keeps the newest 2.0.x proven too, examples included.
     steps:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v7

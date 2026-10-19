@@ -36,7 +36,7 @@ import socket
 import threading
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any, TypeVar
 
@@ -176,7 +176,7 @@ def _build(connection: Connection, plan: Plan, *, create_marker: bool) -> None:
             MARKER.insert().values(
                 run_id=plan.run_id,
                 workers=1,
-                started_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                started_at=datetime.now(UTC).isoformat(timespec="seconds"),
                 owner=plan.owner,
             )
         )

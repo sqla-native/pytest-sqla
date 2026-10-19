@@ -175,7 +175,7 @@ def test_a_write_lock_that_never_comes_leaves_sqlite3_its_transaction(project: P
 
 def test_the_legacy_check_follows_the_runtime_default(monkeypatch: pytest.MonkeyPatch) -> None:
     legacy = getattr(sqlite3, "LEGACY_TRANSACTION_CONTROL", -1)
-    assert _sqlite.default_autocommit() == legacy  # Python 3.10 to 3.15
+    assert _sqlite.default_autocommit() == legacy  # Python 3.11 to 3.15
     assert _sqlite.runs_legacy_transaction_control({})
     assert not _sqlite.runs_legacy_transaction_control({"autocommit": False})
 

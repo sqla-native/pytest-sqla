@@ -26,16 +26,16 @@ classifiers = [
     "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: 3.15",
     "Topic :: Database",
     "Topic :: Software Development :: Testing",
     "Typing :: Typed",
 ]
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 
 # Constitution section 5: exactly TWO runtime dependencies. pytest-asyncio and
 # greenlet are an extra, never a dependency: a sync-only suite must install and
@@ -95,11 +95,11 @@ filterwarnings = ["error"]
 [tool.coverage.run]
 branch = true
 source = ["pytest_sqla"]
-# coverage 7.15.3+ picks the sys.monitoring core by default on Python 3.14, and
+# coverage 7.15.3+ picks the sys.monitoring core by default on Python 3.14+, and
 # that core cannot record dynamic contexts: every switch_context() then warns,
 # which filterwarnings = error turns into an error per test. This project never
 # uses contexts (never add --cov-context), and the C tracer is what every other
-# supported version runs, so pin it and keep 3.14 identical to the rest. A
+# supported version runs, so pin it and keep 3.14+ identical to the rest. A
 # non-empty COVERAGE_CORE in the environment still overrides this.
 core = "ctrace"
 # SQLAlchemy's asyncio extension runs the sync code in greenlets. Traced as
@@ -135,7 +135,7 @@ ignore = ["ANN401"]
 "scripts/*" = ["ANN"]
 
 [tool.mypy]
-python_version = "3.10"
+python_version = "3.11"
 strict = true
 files = ["src/pytest_sqla"]
 

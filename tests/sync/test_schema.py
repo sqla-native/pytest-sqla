@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import sqlite3
-import sys
 from pathlib import Path
 
 import pytest
@@ -543,7 +542,6 @@ def test_an_unread_result_cannot_block_a_disposable_database(project: Project) -
     result.assert_outcomes(failed=1)
 
 
-@pytest.mark.skipif(sys.version_info < (3, 11), reason="3.10's rollback resets the statement")
 def test_an_unread_result_holding_a_named_file_is_explained(
     project: Project, database: str
 ) -> None:
