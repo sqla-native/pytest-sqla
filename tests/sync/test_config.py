@@ -348,11 +348,16 @@ def test_the_lock_timeout_is_a_number_in_native_toml(pytester: pytest.Pytester, 
 
 @pytest.mark.skipif(pytest.version_tuple < (9,), reason="native TOML configuration is pytest 9")
 def test_a_quoted_lock_timeout_in_native_toml_is_a_usage_error(pytester: pytest.Pytester) -> None:
+    """pytest-asyncio warns at configure time when its loop scope is unset; under this
+    suite's ``filterwarnings = error`` that is an INTERNALERROR instead of the usage error
+    whenever its hook runs before pytest-sqla's, which the registration order decides."""
+    asyncio = 'asyncio_default_fixture_loop_scope = "function"' if HAS_PYTEST_ASYNCIO else ""
     pytester.makepyprojecttoml(
-        """
+        f"""
         [tool.pytest]
         addopts = ["-p", "no:cacheprovider"]
         sqla_lock_timeout = "30"
+        {asyncio}
         """
     )
     pytester.makepyfile(test_inner="def test_nothing():\n    pass\n")
