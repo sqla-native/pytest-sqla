@@ -596,8 +596,7 @@ fixtures plug in the same way.
 
 ## Compatibility
 
-- Python 3.10 to 3.14. Python 3.10 runs on SQLAlchemy 2.0, because 2.1
-  requires 3.11.
+- Python 3.11 to 3.15.
 - SQLAlchemy 2.0 and 2.1; pytest 8.2 or newer; pytest-asyncio 1.2 or newer.
 - Tested in CI on PostgreSQL 17 with psycopg 3 (sync and async) and asyncpg,
   on MySQL 8.4 with pymysql, aiomysql and asyncmy, and on SQLite with pysqlite

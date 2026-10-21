@@ -300,7 +300,7 @@ Two harness traps found the hard way, and the rules they leave:
   every lock timeout into its error; one loop rolls back every savepoint).
 - **Cognitive complexity ≤ 15 per function**, enforced by **complexipy**.
 - `ruff check`, `ruff format --check` and `mypy --strict` are release gates.
-- **Never `--cov-context`.** On Python 3.14 coverage's default sys.monitoring
+- **Never `--cov-context`.** On Python 3.14+ coverage's default sys.monitoring
   core cannot record contexts and warns on every switch, which
   `filterwarnings = error` turns into an error per test; the config pins
   `core = "ctrace"` for that reason.

@@ -346,7 +346,7 @@ async def _end(state: AsyncState, timeout: float) -> IsolationError | None:
             return IsolationError(_left_running(guard, left))
         try:
             return await asyncio.wait_for(_rollback(state), timeout)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             await connection.invalidate()
             return IsolationError(_too_slow(guard, timeout))
     finally:
