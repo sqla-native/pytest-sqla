@@ -4,6 +4,12 @@ on:
   push:
     branches: [main]
   pull_request:
+  # A weekly run on main catches what moved underneath the plugin between
+  # pushes: SQLAlchemy, pytest, pytest-asyncio, the drivers and the Python
+  # images. GitHub disables the schedule after 60 days without a push.
+  schedule:
+    - cron: "17 6 * * 1" # Mondays, 06:17 UTC
+  workflow_dispatch:
 
 permissions:
   contents: read
