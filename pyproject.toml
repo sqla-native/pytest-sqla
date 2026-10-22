@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "pytest-sqla"
-version = "0.0.1"
+version = "0.0.2"
 description = "Per-test SQLAlchemy 2.x sessions that roll back, sync and async, for pytest"
 readme = "README.md"
 authors = [{ name = "Rodrigo Nogueira", email = "rodrigo.b.nogueira@gmail.com" }]
