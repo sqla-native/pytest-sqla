@@ -162,7 +162,10 @@ def _lock_timeout(config: pytest.Config) -> float:
     """Seconds, from a number or a numeric string; pytest may already have parsed it."""
     try:
         seconds = float(config.getini("sqla_lock_timeout"))
-    except (TypeError, ValueError) as error:
+    # pytest 9.2 raises its own UsageError when the value does not convert, with
+    # a message that, from an ini file, does not name the option; earlier
+    # versions raise the ValueError or TypeError itself.
+    except (TypeError, ValueError, pytest.UsageError) as error:
         raise pytest.UsageError(
             f"pytest-sqla: sqla_lock_timeout must be a positive number of seconds: {error}."
         ) from None

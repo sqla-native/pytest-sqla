@@ -4,6 +4,18 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.0.3] - 2026-11-08
+
+### Fixed
+
+- **A `sqla_lock_timeout` that is not a number names the option again on
+  pytest 9.2.** pytest 9.2.0 converts the value itself and raises its own
+  usage error, before pytest-sqla reads it, and from an ini file that error
+  did not say which option it was about: `ERROR: could not convert string to
+  float: 'soon'`. pytest-sqla now puts its own message around it, as on
+  earlier pytest versions: `pytest-sqla: sqla_lock_timeout must be a positive
+  number of seconds: could not convert string to float: 'soon'.`
+
 ## [0.0.2] - 2026-10-21
 
 ### Added
@@ -75,5 +87,6 @@ Initial release.
   pool sizing options reach only pooled engines. `sqla_lock_timeout` takes a
   number in pytest 9's native TOML configuration.
 
+[0.0.3]: https://github.com/sqla-native/pytest-sqla/releases/tag/v0.0.3
 [0.0.2]: https://github.com/sqla-native/pytest-sqla/releases/tag/v0.0.2
 [0.0.1]: https://github.com/sqla-native/pytest-sqla/releases/tag/v0.0.1
