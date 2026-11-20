@@ -33,6 +33,13 @@ refused at creation and left alone at the end; one that could not be marked
 is dropped again, being this process's own. Inside it, ``sqla_schema =
 create`` keeps its own marker and protocol; the tables go with the database.
 
+**Alembic.** With ``sqla_schema = alembic`` the worker that creates the
+database migrates it right there, under the lock, before anyone may join: the
+others wait on the lock, bounded by ``sqla_lock_timeout``, and then join a
+migrated database. A migration that fails drops the database again, after the
+same three checks, so no worker ever joins one half migrated: the next one to
+take the lock creates it again and reports the same error itself.
+
 **Never hang.** ``sqla_lock_timeout`` bounds the lock and the lock waits of
 CREATE and DROP (``lock_timeout``, ``lock_wait_timeout``), and a timeout
 becomes SchemaConflictError naming the cause. PostgreSQL 13 and later drop
@@ -289,13 +296,17 @@ _SERVERS: Mapping[str, _Server] = {
 # ------------------------------------------------------------- the protocol
 
 
-def join(owned: Owned, engine_options: Mapping[str, Any]) -> tuple[str, list[str]]:
+def join(
+    owned: Owned, engine_options: Mapping[str, Any], build: Callable[[], None] | None = None
+) -> tuple[str, list[str]]:
     """Create the database, or join the workers already in it.
 
-    Returns what happened, and, when it created the database, a line for the
-    summary about each database another run left on the server.
+    ``build`` runs right after creating it, under the lock: the Alembic
+    migration of ``sqla_schema = alembic``. Returns what happened, and, when
+    it created the database, a line for the summary about each database
+    another run left on the server.
     """
-    return _on_admin(owned, engine_options, _join)
+    return _on_admin(owned, engine_options, lambda connection, _: _join(connection, owned, build))
 
 
 def leave(owned: Owned, engine_options: Mapping[str, Any]) -> str:
@@ -303,16 +314,46 @@ def leave(owned: Owned, engine_options: Mapping[str, Any]) -> str:
     return _on_admin(owned, engine_options, _leave)
 
 
-def _join(connection: Connection, owned: Owned) -> tuple[str, list[str]]:
+def _join(
+    connection: Connection, owned: Owned, build: Callable[[], None] | None
+) -> tuple[str, list[str]]:
     server = _SERVERS[connection.dialect.name]
     server.lock(connection, owned)
     exists, mark = server.find(connection, owned.name)
     if not exists:
-        return "created", _create(connection, server, owned)
+        left_behind = _create(connection, server, owned)
+        if build is not None:
+            _build(connection, server, owned, build)
+        return "created", left_behind
     if mark is None or mark.run_id != owned.run_id:
         raise SchemaConflictError(_not_ours(owned, mark))
     server.mark(connection, owned.name, replace(mark, workers=mark.workers + 1))
     return "joined", []
+
+
+def _build(
+    connection: Connection, server: _Server, owned: Owned, build: Callable[[], None]
+) -> None:
+    """Migrate the database just created; one that fails is dropped again, under the lock.
+
+    Nobody can have joined it yet, and nobody will join it half migrated: a
+    worker waiting on the lock finds no database, creates it again, and
+    reports the same error itself. The DROP takes the three checks every DROP
+    takes, because the migration ran in between and could have changed the
+    mark.
+    """
+    try:
+        build()
+    except BaseException:
+        if _our_mark(connection, server, owned) is not None:
+            server.drop(connection, owned)
+        raise
+
+
+def _our_mark(connection: Connection, server: _Server, owned: Owned) -> Mark | None:
+    """The database's mark when it is this run's: the second and third checks before a DROP."""
+    _, mark = server.find(connection, owned.name)
+    return mark if mark is not None and mark.run_id == owned.run_id else None
 
 
 def _create(connection: Connection, server: _Server, owned: Owned) -> list[str]:
@@ -341,8 +382,8 @@ def _create(connection: Connection, server: _Server, owned: Owned) -> list[str]:
 def _leave(connection: Connection, owned: Owned) -> str:
     server = _SERVERS[connection.dialect.name]
     server.lock(connection, owned)
-    _, mark = server.find(connection, owned.name)
-    if mark is None or mark.run_id != owned.run_id:
+    mark = _our_mark(connection, server, owned)
+    if mark is None:
         # Dropped, or marked by someone else since: not this run's to drop any more.
         return "gone"
     workers = mark.workers - 1
@@ -391,11 +432,18 @@ async def _on_async_admin(
 
 def _waited_too_long(owned: Owned, error: DBAPIError | None = None) -> SchemaConflictError:
     detail = "" if error is None else f" The driver reported: {error.orig}"
+    migrating = (
+        " With sqla_schema = alembic, the worker that creates the database runs the migrations "
+        "while it holds the lock: raise sqla_lock_timeout above the time they take, or set "
+        "sqla_database = worker, so that each worker migrates a database of its own."
+        if owned.migrates
+        else ""
+    )
     return SchemaConflictError(
         f"pytest-sqla: gave up after {owned.lock_timeout:g} s waiting for the lock on the "
         f"database {render(owned.url)}; another pytest-sqla process, usually a worker of this "
         "run, is creating, joining or dropping it. A crashed process releases the lock when its "
-        f"connection closes.{detail}"
+        f"connection closes.{migrating}{detail}"
     )
 
 

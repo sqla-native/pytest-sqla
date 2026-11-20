@@ -1,6 +1,6 @@
 """Every engine pytest-sqla creates, and the options it refuses to pass on.
 
-Four kinds:
+Five kinds:
 
 * the session-wide **sync engine**: NullPool, so every test gets a DBAPI
   connection of its own, unless ``sqla_engine_options`` choose a pool;
@@ -11,7 +11,9 @@ Four kinds:
 * short-lived NullPool **schema engines** for DDL (see ``_schema``);
 * short-lived NullPool **admin engines** on the configured database, whose
   AUTOCOMMIT connections create and drop a database of pytest-sqla's own
-  (see ``_database``).
+  (see ``_database``);
+* a short-lived NullPool **migration engine**, whose idle connection
+  ``sqla_schema = alembic`` hands to env.py (see ``_alembic``).
 
 **Why a fresh connection per test.** ROLLBACK undoes rows, not a session's
 state, and a pooled connection hands that state to the next test. Measured
@@ -188,6 +190,17 @@ def admin_engine(url: URL, options: Mapping[str, Any]) -> Engine:
 
     The caller switches its connection to AUTOCOMMIT, because PostgreSQL runs
     neither statement inside a transaction block.
+    """
+    check_engine_options(url, options, for_async=False)
+    return create_engine(url, **_unpooled(options))
+
+
+def migration_engine(url: URL, options: Mapping[str, Any]) -> Engine:
+    """For the connection ``sqla_schema = alembic`` hands env.py: NullPool and the user's options.
+
+    No savepoint fix on SQLite: the engine is what env.py would build for
+    itself, so Alembic manages its transactions exactly as its command line
+    does.
     """
     check_engine_options(url, options, for_async=False)
     return create_engine(url, **_unpooled(options))
