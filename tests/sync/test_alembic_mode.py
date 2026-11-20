@@ -9,7 +9,6 @@ creates the database migrates it under the lock, are in
 from __future__ import annotations
 
 import ast
-import sqlite3
 import sys
 import textwrap
 from pathlib import Path
@@ -26,7 +25,7 @@ from tests.alembic_kit import (
     alembic_project,
     ini_lines,
 )
-from tests.helpers import Project
+from tests.helpers import Project, sqlite_rows
 
 pytest.importorskip("alembic")
 
@@ -578,12 +577,9 @@ def test_a_connection_sqlalchemy_did_not_make_from_its_arguments_is_refused(
             'only. Make env.py use config.attributes[[]"connection"]*'
         ]
     )
-    assert (
-        sqlite3.connect(project.path / "other.db")
-        .execute("SELECT name FROM sqlite_master")
-        .fetchall()
-        == []
-    ), "nothing ran there"
+    assert sqlite_rows(project.path / "other.db", "SELECT name FROM sqlite_master") == [], (
+        "nothing ran there"
+    )
 
 
 def alembic_project_env(project: Project, env: str) -> None:

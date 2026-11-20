@@ -458,7 +458,7 @@ so one that fails, or stops half way, leaves nothing that anything uses:
 [tool.pytest.ini_options]
 sqla_url = "sqlite://"
 sqla_schema = "alembic"
-sqla_database = "run"   # for PostgreSQL and MySQL, set through PYTEST_SQLA_URL
+sqla_database = "run"   # when PYTEST_SQLA_URL points at PostgreSQL or MySQL in CI
 ```
 
 `sqla_metadata` is not needed, and ignored if set, so one configuration can
