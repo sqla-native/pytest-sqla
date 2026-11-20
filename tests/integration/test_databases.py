@@ -676,6 +676,60 @@ def test_a_connection_the_run_leaked_cannot_hang_the_drop(
         assert owned_databases(sync_database) == []
 
 
+COUNT_SESSIONS = """
+import pytest
+from sqlalchemy import event
+from sqlalchemy.engine import Engine
+from sqlalchemy.pool import QueuePool
+
+SESSIONS = []
+ON_POSTGRESQL = (
+    "SELECT count(*) FROM pg_stat_activity WHERE datname = %s AND pid <> pg_backend_pid()"
+)
+ON_MYSQL = "SELECT count(*) FROM information_schema.processlist WHERE db = %s"
+
+
+def count_sessions(conn, cursor, statement, parameters, context, executemany):
+    # PostgreSQL ends the database's sessions right before its DROP; MySQL drops with them on.
+    if conn.dialect.name == "postgresql" and "pg_terminate_backend" in statement:
+        cursor.execute(ON_POSTGRESQL, (parameters["name"],))
+    elif conn.dialect.name == "mysql" and statement.startswith("DROP DATABASE"):
+        cursor.execute(ON_MYSQL, (statement.split("`")[1],))
+    else:
+        return
+    SESSIONS.append(cursor.fetchone()[0])
+
+
+def pytest_configure(config):
+    event.listen(Engine, "before_cursor_execute", count_sessions)
+
+
+def pytest_unconfigure(config):
+    event.remove(Engine, "before_cursor_execute", count_sessions)
+    print(f"sessions on the database before its drop: {SESSIONS}")
+
+
+@pytest.fixture(scope="session")
+def sqla_engine_options():
+    return {"poolclass": QueuePool}
+"""
+
+
+def test_pytest_sqlas_own_connections_are_closed_before_the_drop(
+    project: Project, sync_database: Database
+) -> None:
+    """With a pool of your own the sync engine keeps an idle connection after the tests;
+    every fixture that connects depends on the one that drops, so all are gone by then."""
+    project.ini(sqla_database="run")
+    project.models()
+    project.conftest(COUNT_SESSIONS)
+    project.tests(RUN_TESTS)
+    result = project.run("--sqla-url", sync_database.url)
+    result.assert_outcomes(passed=3)
+    result.stdout.fnmatch_lines(["sessions on the database before its drop: [[]0[]]"])
+    assert owned_databases(sync_database) == []
+
+
 def test_before_postgresql_13_the_sessions_are_ended_before_the_drop(
     postgresql_database: Database,
 ) -> None:
@@ -957,3 +1011,19 @@ def test_the_readme_alembic_recipe_migrates_a_run_database(
     result.assert_outcomes(passed=2)
     assert owned_databases(postgresql_database) == []
     assert postgresql_database.tables() == [], "Alembic never touched the configured database"
+
+
+def test_the_readme_alembic_recipe_migrates_each_workers_database(
+    project: Project, postgresql_database: Database
+) -> None:
+    """Under xdist the override runs once per worker; in worker mode each has a database of
+    its own to migrate, so the migrations need no lock."""
+    from tests.sync.test_alembic_recipe import alembic_project, readme_recipe
+
+    alembic_project(project, readme_recipe())
+    project.tests(WRITERS)
+    project.ini(sqla_database="worker")
+    result = project.run_subprocess("-n", "3", "--sqla-url", postgresql_database.url, timeout=300)
+    result.assert_outcomes(passed=12)
+    assert owned_databases(postgresql_database) == []
+    assert postgresql_database.tables() == []
