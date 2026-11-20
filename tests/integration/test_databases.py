@@ -684,7 +684,8 @@ from sqlalchemy.pool import QueuePool
 
 SESSIONS = []
 ON_POSTGRESQL = (
-    "SELECT count(*) FROM pg_stat_activity WHERE datname = %s AND pid <> pg_backend_pid()"
+    "SELECT count(*) FROM pg_stat_activity WHERE datname = %s AND pid <> pg_backend_pid() "
+    "AND backend_type = 'client backend'"
 )
 ON_MYSQL = "SELECT count(*) FROM information_schema.processlist WHERE db = %s"
 
@@ -863,6 +864,51 @@ def test_a_database_with_the_name_but_not_the_mark_is_refused_and_kept(
         sync_database, lambda c: c.scalar(text("SELECT count(*) FROM precious")), name=name
     )
     assert precious == 1
+
+
+def test_a_database_that_cannot_be_marked_is_dropped_again(
+    project: Project, mysql_database: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """MySQL's mark keeps the run id in VARCHAR(64), as the schema's marker does, so a
+    longer one set by hand cannot be written; unmarked, the database pytest-sqla had just
+    created would stay behind for good."""
+    monkeypatch.setenv("PYTEST_XDIST_TESTRUNUID", "a" * 65)
+    project.ini(sqla_database="run")
+    result = inner(project, mysql_database, "def test_db(sqla_session):\n    pass\n")
+    result.assert_outcomes(errors=1)
+    result.stdout.fnmatch_lines(
+        [
+            "*SchemaConflictError: pytest-sqla: created the database *sqla_aaaaaaaa for "
+            "sqla_database = run, but could not mark it as its own, so it dropped it again. The "
+            "driver reported: (1406, *"
+        ]
+    )
+    assert owned_databases(mysql_database) == []
+
+
+def test_a_mark_that_cannot_be_read_in_time_is_not_waited_for(
+    project: Project, mysql_database: Database
+) -> None:
+    """Another run's DROP holds the locks on its tables while it waits. Looking for the
+    databases other runs left, a run skips a mark it cannot read within a second, instead
+    of waiting out its lock timeout and failing after it created its own database."""
+    other = f"{configured(mysql_database)}_ffffffff"
+    create_database(mysql_database, other, ANOTHER_RUN)
+    engine = create_engine(
+        sync_twin(mysql_database.url), poolclass=NullPool, isolation_level="AUTOCOMMIT"
+    )
+    holder = engine.connect()
+    holder.exec_driver_sql(f"LOCK TABLES `{other}`.pytest_sqla_database WRITE")
+    try:
+        project.ini(sqla_database="run")
+        result = inner(project, mysql_database, "def test_db(sqla_session):\n    pass\n")
+    finally:
+        holder.exec_driver_sql("UNLOCK TABLES")
+        holder.close()
+        engine.dispose()
+    result.assert_outcomes(passed=1)
+    result.stdout.no_fnmatch_line(f"*{other} is still on the server*")
+    assert owned_databases(mysql_database) == [other]
 
 
 def test_a_held_database_lock_times_out(

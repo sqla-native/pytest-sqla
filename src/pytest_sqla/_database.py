@@ -17,7 +17,7 @@ when it is missing, or joins it, and the mark counts the workers inside.
 Leaving, a worker counts itself out under the same lock, and the last one out
 drops the database. A late worker therefore either joins a live database or
 creates it again, never one that is being dropped. The lock key derives from
-the database's name, so separate runs never wait for each other.
+the database's name, so separate runs never queue for one lock.
 
 **Ownership.** A test plugin must never destroy what it did not create. The
 mark is written right after CREATE, under the lock. On PostgreSQL it is the
@@ -29,7 +29,8 @@ the same connection. A database is dropped only when all three hold, checked
 under the lock right before the DROP: its name derives from this run's id (it
 is an ``Owned``, never a name from elsewhere), it carries the mark, and the
 mark's run id is this run's. A database with the name but not the rest is
-refused at creation and left alone at the end. Inside it, ``sqla_schema =
+refused at creation and left alone at the end; one that could not be marked
+is dropped again, being this process's own. Inside it, ``sqla_schema =
 create`` keeps its own marker and protocol; the tables go with the database.
 
 **Never hang.** ``sqla_lock_timeout`` bounds the lock and the lock waits of
@@ -43,7 +44,8 @@ On MySQL a leaked connection's open transaction holds the DROP, bounded.
 count never reaches 0 and the database stays. Creating one, pytest-sqla lists
 the databases named after the same configured database that carry another
 run's mark, and the run's summary names them: one catalog query on
-PostgreSQL, under the lock it already holds.
+PostgreSQL, under the lock it already holds. On MySQL the marks are tables,
+and one that another run's DROP keeps locked is skipped after a second.
 """
 
 from __future__ import annotations
@@ -159,6 +161,9 @@ class _Server:
     def create(self, connection: Connection, owned: Owned) -> None:
         raise NotImplementedError
 
+    def first_mark(self, connection: Connection, name: str, mark: Mark) -> None:
+        raise NotImplementedError
+
     def mark(self, connection: Connection, name: str, mark: Mark) -> None:
         raise NotImplementedError
 
@@ -173,9 +178,11 @@ class _Server:
 _FIND_POSTGRESQL = text(
     "SELECT shobj_description(oid, 'pg_database') FROM pg_database WHERE datname = :name"
 )
+# Client sessions only: DROP DATABASE ends autovacuum workers itself, and a role
+# that is not a superuser may not signal them.
 _END_SESSIONS = text(
     "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
-    "WHERE datname = :name AND pid <> pg_backend_pid()"
+    "WHERE datname = :name AND pid <> pg_backend_pid() AND backend_type = 'client backend'"
 )
 _OTHERS_POSTGRESQL = text(
     "SELECT datname, shobj_description(oid, 'pg_database') FROM pg_database "
@@ -199,7 +206,9 @@ class _PostgreSQL(_Server):
 
     def create(self, connection: Connection, owned: Owned) -> None:
         connection.exec_driver_sql(f"CREATE DATABASE {_quoted(connection, owned.name)}")
-        self.mark(connection, owned.name, new_mark(owned))
+
+    def first_mark(self, connection: Connection, name: str, mark: Mark) -> None:
+        self.mark(connection, name, mark)
 
     def mark(self, connection: Connection, name: str, mark: Mark) -> None:
         connection.exec_driver_sql(
@@ -244,9 +253,11 @@ class _MySQL(_Server):
 
     def create(self, connection: Connection, owned: Owned) -> None:
         connection.exec_driver_sql(f"CREATE DATABASE {_quoted(connection, owned.name)}")
-        table = mark_table(owned.name)
+
+    def first_mark(self, connection: Connection, name: str, mark: Mark) -> None:
+        table = mark_table(name)
         table.create(connection)
-        connection.execute(table.insert().values(**asdict(new_mark(owned))))
+        connection.execute(table.insert().values(**asdict(mark)))
 
     def mark(self, connection: Connection, name: str, mark: Mark) -> None:
         connection.execute(mark_table(name).update().values(workers=mark.workers))
@@ -255,8 +266,17 @@ class _MySQL(_Server):
         connection.exec_driver_sql(f"DROP DATABASE {_quoted(connection, owned.name)}")
 
     def others(self, connection: Connection, owned: Owned) -> list[tuple[str, Mark | None]]:
+        # Another run's DROP holds the locks on its tables until it ends: a mark not
+        # readable within a second is skipped, never a reason for this run to wait or fail.
+        connection.exec_driver_sql("SET SESSION lock_wait_timeout = 1")
         names = connection.scalars(_OTHERS_MYSQL, {"pattern": name_pattern(owned)}).all()
-        return [(name, self.find(connection, name)[1]) for name in names]
+        return [(name, self._readable_mark(connection, name)) for name in names]
+
+    def _readable_mark(self, connection: Connection, name: str) -> Mark | None:
+        try:
+            return self.find(connection, name)[1]
+        except DBAPIError:
+            return None
 
 
 _SERVERS: Mapping[str, _Server] = {
@@ -288,20 +308,34 @@ def _join(connection: Connection, owned: Owned) -> tuple[str, list[str]]:
     server.lock(connection, owned)
     exists, mark = server.find(connection, owned.name)
     if not exists:
-        try:
-            server.create(connection, owned)
-        except DBAPIError as error:
-            raise _could_not(connection, owned, "create", error) from error
-        others = server.others(connection, owned)
-        return "created", [
-            _left_behind(owned, name, other)
-            for name, other in others
-            if other is not None and other.run_id != owned.run_id
-        ]
+        return "created", _create(connection, server, owned)
     if mark is None or mark.run_id != owned.run_id:
         raise SchemaConflictError(_not_ours(owned, mark))
     server.mark(connection, owned.name, replace(mark, workers=mark.workers + 1))
     return "joined", []
+
+
+def _create(connection: Connection, server: _Server, owned: Owned) -> list[str]:
+    """CREATE DATABASE and the mark; the summary's lines about databases other runs left.
+
+    A database that could not be marked is dropped again: it is this
+    process's, created a moment ago under the lock, and unmarked it would stay
+    behind for good, refused by every later run.
+    """
+    try:
+        server.create(connection, owned)
+    except DBAPIError as error:
+        raise _could_not(connection, owned, "create", error) from error
+    try:
+        server.first_mark(connection, owned.name, new_mark(owned))
+    except DBAPIError as error:
+        server.drop(connection, owned)
+        raise _unmarked(owned, error) from error
+    return [
+        _left_behind(owned, name, other)
+        for name, other in server.others(connection, owned)
+        if other is not None and other.run_id != owned.run_id
+    ]
 
 
 def _leave(connection: Connection, owned: Owned) -> str:
@@ -418,6 +452,14 @@ def _could_not(
     return SchemaConflictError(
         f"pytest-sqla: could not {step} the database {render(owned.url)} for sqla_database = "
         f"{owned.mode}.{reason.rstrip()} The driver reported: {error.orig}"
+    )
+
+
+def _unmarked(owned: Owned, error: DBAPIError) -> SchemaConflictError:
+    return SchemaConflictError(
+        f"pytest-sqla: created the database {render(owned.url)} for sqla_database = "
+        f"{owned.mode}, but could not mark it as its own, so it dropped it again. The driver "
+        f"reported: {error.orig}"
     )
 
 
