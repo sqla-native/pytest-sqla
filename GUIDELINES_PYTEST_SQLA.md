@@ -232,7 +232,11 @@ isolation fails, at its own teardown, saying why.
 ### 5. Implementation rules
 
 - **Exactly two runtime dependencies: `sqlalchemy>=2.0` and `pytest>=8.2`.**
-  pytest-asyncio and greenlet are the `asyncio` extra. Adding a dependency
+  pytest-asyncio and greenlet are the `asyncio` extra. alembic is the
+  `alembic` extra, for `sqla_schema = alembic` only: it is imported inside
+  function bodies, so an install without it loads the plugin and runs every
+  other mode, and asking for that mode without it is a usage error that names
+  the extra. Its floor is proven in CI like the others. Adding a dependency
   requires an amendment to this document, argued on its own merits, in its own
   PR.
 - **Never echo a password.** Every URL is rendered with
