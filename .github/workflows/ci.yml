@@ -172,11 +172,13 @@ jobs:
   floor:
     name: Oldest supported versions
     runs-on: ubuntu-latest
-    # The declared floors: Python 3.11, sqlalchemy>=2.0, pytest>=8.2 and, in
-    # the asyncio extra, pytest-asyncio>=1.2. pytest-asyncio 1.0 and 1.1 were
-    # measured running a test on another loop than its own scope's fixtures;
-    # 1.2 is the first that holds, and pytest 8.2 is its own floor. The loop
-    # handling is what the floor is about, so the real servers run here too.
+    # The declared floors: Python 3.11, sqlalchemy>=2.0, pytest>=8.2, in the
+    # asyncio extra pytest-asyncio>=1.2, and in the alembic extra alembic>=1.16.
+    # pytest-asyncio 1.0 and 1.1 were measured running a test on another loop
+    # than its own scope's fixtures; 1.2 is the first that holds, and pytest
+    # 8.2 is its own floor. alembic 1.16.0 is the first with Config(toml_file=)
+    # and the path helpers sqla_schema = alembic uses. The loop handling is what
+    # the floor is about, so the real servers run here too.
     services:
       postgres:
         image: postgres:17-alpine
@@ -210,11 +212,11 @@ jobs:
         with:
           python-version: "3.11"
       - run: uv pip install --system -e . --group dev
-      - run: uv pip install --system "sqlalchemy[asyncio]==2.0.0" "pytest==8.2.0" "pytest-asyncio==1.2.0"
+      - run: uv pip install --system "sqlalchemy[asyncio]==2.0.0" "pytest==8.2.0" "pytest-asyncio==1.2.0" "alembic==1.16.0"
       - run: |
           python -c "
-          import pytest, pytest_asyncio, sqlalchemy
-          print('sqlalchemy', sqlalchemy.__version__)
+          import alembic, pytest, pytest_asyncio, sqlalchemy
+          print('sqlalchemy', sqlalchemy.__version__, 'alembic', alembic.__version__)
           print('pytest', pytest.__version__, 'pytest-asyncio', pytest_asyncio.__version__)
           "
       - run: pytest -q
@@ -250,9 +252,10 @@ jobs:
     name: Sync-only install
     runs-on: ubuntu-latest
     # What `pip install pytest-sqla` gives you on SQLAlchemy 2.1: no
-    # pytest-asyncio, no anyio, no greenlet, no aiosqlite. The plugin must load,
-    # every sync fixture must work, and an async fixture must fail with
-    # pytest-sqla's own message rather than an ImportError.
+    # pytest-asyncio, no anyio, no greenlet, no aiosqlite, no alembic. The
+    # plugin must load, every sync fixture must work, an async fixture must
+    # fail with pytest-sqla's own message rather than an ImportError, and
+    # sqla_schema = alembic with the usage error that names the extra.
     steps:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v7
@@ -260,9 +263,9 @@ jobs:
         with:
           python-version: "3.13"
       - run: uv pip install --system . pytest
-      - name: The environment really lacks the async stack
+      - name: The environment really lacks the async stack and alembic
         run: |
-          for module in greenlet pytest_asyncio anyio aiosqlite; do
+          for module in greenlet pytest_asyncio anyio aiosqlite alembic; do
             if python -c "import $module" 2>/dev/null; then
               echo "::error::$module is installed; this job proves nothing"
               exit 1
@@ -393,7 +396,7 @@ jobs:
         run: python scripts/check_packed_consumer.py
 
       # Audits the published closure only - what `pip install
-      # "pytest-sqla[asyncio]"` pulls in. Dev-tooling advisories are
+      # "pytest-sqla[asyncio,alembic]"` pulls in. Dev-tooling advisories are
       # Dependabot's job and do not block a release.
       - name: Audit the production surface
         run: python scripts/audit_production_surface.py

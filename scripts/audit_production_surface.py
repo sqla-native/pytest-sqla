@@ -2,10 +2,11 @@
 
 ``pip-audit`` run in the dev virtualenv reports advisories in mypy, ruff, the
 database drivers and friends - none of which a consumer installs. This builds
-the wheel, installs only it, with its ``asyncio`` extra, into a throwaway
-virtualenv, and audits that closure: SQLAlchemy, pytest and their own
-dependencies, plus pytest-asyncio and greenlet from the extra. That is exactly
-what ``pip install "pytest-sqla[asyncio]"`` pulls in.
+the wheel, installs only it, with its ``asyncio`` and ``alembic`` extras, into
+a throwaway virtualenv, and audits that closure: SQLAlchemy, pytest and their
+own dependencies, pytest-asyncio and greenlet from one extra, and alembic,
+Mako and MarkupSafe from the other. That is exactly what ``pip install
+"pytest-sqla[asyncio,alembic]"`` pulls in.
 """
 
 from __future__ import annotations
@@ -40,7 +41,7 @@ def main() -> int:
         run(sys.executable, "-m", "venv", str(venv))
         python = venv / "bin" / "python"
         run(str(python), "-m", "pip", "install", "--quiet", "--upgrade", "pip")
-        run(str(python), "-m", "pip", "install", "--quiet", f"{wheels[0]}[asyncio]")
+        run(str(python), "-m", "pip", "install", "--quiet", f"{wheels[0]}[asyncio,alembic]")
 
         # Audit the *dependencies*, not the distribution itself. The version
         # being released is by definition not on PyPI yet, and --strict (which
