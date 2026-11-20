@@ -18,9 +18,9 @@ wrong, and fails silently when it is wrong.
 2. **Async objects live on the test's own event loop.** The public async
    fixtures are sync dispatchers; an engine shared across loops is NullPool;
    `sqlalchemy.ext.asyncio` is never imported at module level.
-3. **Never drop a table pytest-sqla did not create, and never skip
-   silently.** No default database, no SQLite fallback, no skipped
-   real-database suite that reports green.
+3. **Never drop a table or a database pytest-sqla did not create, and
+   never skip silently.** No default database, no SQLite fallback, no
+   skipped real-database suite that reports green.
 
 ## Before opening a PR
 
@@ -46,7 +46,8 @@ docker compose down -v
 ```
 
 Run them before any PR that touches `_isolation.py`, `_schema.py`,
-`_asyncio.py` or `_engines.py`, and stop the containers when you are done.
+`_database.py`, `_asyncio.py` or `_engines.py`, and stop the containers when
+you are done.
 
 ## Measure, don't reason from memory
 

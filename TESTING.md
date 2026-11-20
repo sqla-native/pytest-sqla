@@ -28,7 +28,7 @@ Plus the static gates on every run: `ruff check`, `ruff format --check`,
 
 | You changed | Run |
 | --- | --- |
-| `_isolation.py`, `_schema.py`, `_asyncio.py`, `_engines.py` | `verify.sh --all`, then a scoped mutation run |
+| `_isolation.py`, `_schema.py`, `_database.py`, `_asyncio.py`, `_engines.py` | `verify.sh --all`, then a scoped mutation run |
 | `_config.py`, `_sqlite.py`, `plugin.py` | `verify.sh`; `--all` if a database path changed |
 | An error message | `verify.sh`: the tests pin the wording |
 | Anything with a performance claim | `python scripts/benchmark.py` before and after |
@@ -59,7 +59,12 @@ inertness check use a subprocess.
   the async family under pytest-asyncio strict and auto mode, every loop
   scope, anyio and both plugin orders, the loop guard, tasks a test leaves
   running, NullPool and per-loop pools.
-- `tests/test_xdist.py`: per-worker SQLite files, per-process memory databases.
+- `tests/test_xdist.py`: per-worker SQLite files, per-process memory databases,
+  and, in-process so that coverage sees the controller's hooks, the run id
+  the controller hands its workers and the lines it collects from them.
+- `tests/sync/test_database.py`: `sqla_database` without a server: its usage
+  errors, the names it derives and their length limits, the report header,
+  the URL fixtures, and SQLite, where it changes nothing.
 
 Controls keep the suite honest: `tests/sync/test_sqlite.py` shows the SQLite
 savepoint leak without the fix, and `tests/sync/test_recipe.py` shows the
@@ -89,7 +94,15 @@ commits and deadlocks on MySQL, session state that ROLLBACK keeps, cross-loop
 breakage on asyncpg, advisory locks and `GET_LOCK` timing out, a leaked
 transaction blocking the drop and a live run blocking a recreation, a task left
 running on every async driver, the Alembic recipe with a password that needs
-escaping, and pytest-xdist workers sharing one database.
+escaping, and pytest-xdist workers sharing one database. And
+`tests/integration/test_databases.py`, the databases `sqla_database = run`
+and `worker` create: once per run, joined by a late worker, one per worker,
+two runs at once, a worker killed with SIGKILL, leaked connections at the
+drop, missing privileges, names at the length limit, marks that are not this
+run's, and the control, a database every worker drops and creates.
+`scripts/mysql-init.sql`, which compose.yaml mounts and CI runs, lets the
+MySQL user create the databases named after its own, and adds one that may
+not.
 
 These specs skip when their URL or driver is missing, so a clone stays green.
 **CI fails if they skip**: `SQLA_TEST_REQUIRE_ALL=1` turns each such skip into
@@ -171,5 +184,7 @@ python scripts/benchmark.py
 ```
 
 One isolation cycle per test, pooled and with NullPool, best of 5 runs of 200,
-for every driver with a URL set. Re-run it before changing a number in the
-docs; a single run is too noisy to publish.
+for every driver with a URL set; `--databases` measures one database created
+and dropped instead, as `sqla_database = run` does per run and `worker` per
+worker. Re-run it before changing a number in the docs; a single run is too
+noisy to publish.

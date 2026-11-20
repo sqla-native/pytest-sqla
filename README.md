@@ -22,7 +22,7 @@ that a 30-line conftest gets wrong.
 The plugin most projects find first, pytest-async-sqlalchemy, last shipped in
 October 2021 and fails before its first test on pytest-asyncio 1.x, with
 `fixture 'event_loop' not found`. The others are sync-only, or leave the
-SQLite workaround to you, or monkeypatch SQLAlchemy. pytest-sqla gets six hard
+SQLite workaround to you, or monkeypatch SQLAlchemy. pytest-sqla gets seven hard
 parts right on its own, each one measured:
 
 1. **Commit and rollback stay inside the test.** The default join mode turns
@@ -49,6 +49,11 @@ parts right on its own, each one measured:
    connection itself, or MySQL committing DDL on its own, fails that test's
    teardown, so the leak is reported where it happened instead of surfacing
    as a mystery in some later test.
+7. **A database of its own, when you want one.** With `sqla_database = run`,
+   each pytest run creates its own database on PostgreSQL or MySQL, shared by
+   its xdist workers and dropped by the last one out, or one per worker with
+   `worker`. The usual fixture that drops and recreates one test database
+   breaks under xdist, because every worker drops the one the others use.
 
 ## Install
 
@@ -186,6 +191,8 @@ and under anyio: see
 | --- | --- | --- | --- |
 | `sqla_url` | session | config | The configured database URL, or None. Override it to compute one. |
 | `sqla_async_url` | session | config | The async fixtures' URL; `sqla_url` unless set separately. |
+| `sqla_database_url` | session | config | The URL pytest-sqla connects to, for your own tools: `sqla_url`, or the database `sqla_database` created. |
+| `sqla_async_database_url` | session | config | Its async twin, through `sqla_async_url`'s driver. |
 | `sqla_metadata` | session | config | The metadata to create, from the `sqla_metadata` ini key or an override. |
 | `sqla_engine_options` | session | config | Keyword arguments for every engine. Default `{}`. |
 | `sqla_session_options` | session | config | Keyword arguments for the sessionmakers. Default `{}`. |
@@ -211,8 +218,10 @@ see each other's writes, and asking for both is an error.
 | Async URL | `--sqla-async-url` | `PYTEST_SQLA_ASYNC_URL` | `sqla_async_url` | the database URL |
 | Metadata | | | `sqla_metadata = "app.models:Base"` | none |
 | Schema mode | | | `sqla_schema = create` or `none` | `create` |
+| A database of its own | | | `sqla_database = configured`, `run` or `worker` | `configured` |
 | Lock, DDL and teardown timeout, seconds | | | `sqla_lock_timeout` | `30` |
 | Replace a crashed run's schema | `--sqla-recreate-schema` | | | off |
+| Keep the databases `run` and `worker` create | `--sqla-keep-database` | | | off |
 
 The command line beats the environment, which beats the ini file: the ini value
 is the repository's committed default, the environment is per machine or CI
@@ -227,17 +236,19 @@ replaces the computed value, as with any pytest fixture.
   same reason.
 - **Only its own variables.** pytest-sqla never reads your application's
   `DATABASE_URL`, so it cannot pick up a database that is not for tests.
-- **Checked before the run.** The URLs, the schema mode, the timeout and the
-  shape of `sqla_metadata` are checked at startup; a bad one stops the run
-  with a usage error that never repeats the URL's password.
+- **Checked before the run.** The URLs, the schema and database modes, the
+  timeout, the shape of `sqla_metadata` and the names `sqla_database` derives
+  are checked at startup; a bad one stops the run with a usage error that
+  never repeats the URL's password.
 - **Inert unless asked.** A run whose tests never request an `sqla_*` fixture
   imports no application code, opens no connection, and never imports
   `sqlalchemy.ext.asyncio`.
 - **The report header says which database the run is configured for:**
-  `sqla: url=postgresql+psycopg://app:***@localhost/app_test (from PYTEST_SQLA_URL), schema=create`.
-  It shows the configuration, read before any test runs, so an override of
-  the `sqla_url` fixture, such as a container's URL, is not in it; the URL a
-  test connects to is `sqla_connection.engine.url`.
+  `sqla: url=postgresql+psycopg://app:***@localhost/app_test (from PYTEST_SQLA_URL), schema=create, database=configured`,
+  and with `sqla_database = run`, `database=run (app_test_1a2b3c4d)`. It
+  shows the configuration, read before any test runs, so an override of the
+  `sqla_url` fixture, such as a container's URL, is not in it; the URL
+  pytest-sqla connects to is `sqla_database_url`.
 
 `sqla_engine_options` reaches every engine pytest-sqla creates: `echo`,
 `connect_args`, `json_serializer`, `execution_options` and so on. It refuses
@@ -309,30 +320,102 @@ run, for example by `alembic upgrade head` in a CI step.
 **Overriding the `sqla_schema` fixture** replaces all of it. Set
 `sqla_schema = none` as well, so the URL is used exactly as configured, and use
 a file or server database: an in-memory SQLite database exists only inside
-pytest-sqla's own connections.
+pytest-sqla's own connections. Migrate `sqla_database_url`, the database
+pytest-sqla connects to: the configured one, or the one `sqla_database = run`
+created.
 
 ```python
 import alembic.command
 import alembic.config
 import pytest
-from sqlalchemy import make_url
 
 
 @pytest.fixture(scope="session")
-def sqla_schema(sqla_url):
+def sqla_schema(sqla_database_url):
     config = alembic.config.Config("alembic.ini")
-    # sqla_url may be a str or a URL. Alembic's config reads % as interpolation,
-    # and a rendered URL percent-encodes its password, so every % is doubled.
-    url = make_url(sqla_url).render_as_string(hide_password=False)
+    # Alembic's config reads % as interpolation, and a rendered URL
+    # percent-encodes its password, so every % is doubled.
+    url = sqla_database_url.render_as_string(hide_password=False)
     config.set_main_option("sqlalchemy.url", url.replace("%", "%%"))
     alembic.command.upgrade(config, "head")
     yield
     alembic.command.downgrade(config, "base")
 ```
 
-The suite runs this block as written, against SQLite and against PostgreSQL
-with a password that needs escaping. Under pytest-xdist such an override runs
-once per worker, so it has to serialise itself.
+The suite runs this block as written, against SQLite, against PostgreSQL with
+a password that needs escaping, and into a database of its own on PostgreSQL,
+which is dropped at the end, so there the downgrade only costs time. Under
+pytest-xdist such an override runs once per worker, so it has to serialise
+itself, unless `sqla_database = worker` gives each worker a database to
+migrate on its own.
+
+## A database of its own
+
+**`sqla_database = run`** creates a database for the pytest run on the server
+`sqla_url` points at, named after the database it names: for `.../app_test`,
+`app_test_1a2b3c4d`, where `1a2b3c4d` are the first 8 hex digits of the run's
+id. pytest-xdist workers share it: the first that needs it creates it, the
+others join it, and the last one out drops it. **`sqla_database = worker`**
+gives each xdist worker a database of its own, `app_test_1a2b3c4d_gw0`; without
+xdist it is the run's. **`sqla_database = configured`**, the default, uses the
+configured database itself.
+
+```toml
+[tool.pytest.ini_options]
+sqla_database = "run"
+sqla_metadata = "app.models:Base"
+```
+
+The configured database must exist: pytest-sqla connects there, with the URL's
+credentials, to create and drop the run's, so on PostgreSQL it can be
+`postgres`. The schema, its marker and every test's transaction then live in
+the run's database, and `sqla_database_url` is its URL; the configured one is
+never touched.
+
+- **Privileges.** On PostgreSQL the role needs CREATEDB (`ALTER ROLE app
+  CREATEDB`). On MySQL the user needs privileges on the names derived from the
+  configured database: ``GRANT ALL ON `app\_test\_%`.* TO 'app'@'%'``. MySQL 8.4
+  still applies the wildcard in such a grant, and deprecates it. Without them,
+  every database test fails with a message that says what to grant.
+- **It drops only what it created.** Right after CREATE, pytest-sqla marks the
+  database as its own: on PostgreSQL with the database's comment; on MySQL,
+  whose databases have no comment, with a one-row table inside it,
+  `pytest_sqla_database`. It drops a database only when its name derives from
+  this run's id, it carries the mark, and the mark names this run. A database
+  with the run's name but not the mark is refused and left alone, and so is
+  one whose mark changed during the run.
+- **It never hangs.** Creating, joining and leaving run under a lock on the
+  configured database, `pg_advisory_lock` or `GET_LOCK`, which waits at most
+  `sqla_lock_timeout`, and so does the drop. Before it, pytest-sqla has closed
+  every connection of its own, pooled ones included. On PostgreSQL 13 and
+  later the drop is `WITH (FORCE)`, which also ends the connections your
+  application leaked, and on older servers pytest-sqla ends them first. On
+  MySQL a leaked connection in a transaction holds the drop for
+  `sqla_lock_timeout`; the run then fails with SchemaConflictError, saying so,
+  and the database stays.
+- **Names are checked before the run.** PostgreSQL takes 63 bytes and cuts a
+  longer name to that with only a NOTICE (measured), so two names could become
+  one; MySQL takes 64 characters. A derived name that is too long is a usage
+  error.
+- **Keep it for a look.** `--sqla-keep-database` keeps the databases, tables
+  included, and the end of the run names them, under xdist too.
+- **A killed run leaves its database.** A worker killed with `kill -9` never
+  leaves, so the database stays. When the next run creates its own, its
+  summary names every database another pytest-sqla run left on the server, so
+  you can drop them.
+- **Two runs on one server at once** each get their own and both pass, where in
+  configured mode the second fails with SchemaConflictError.
+- **The cost** is one CREATE and one DROP per run, or per worker; `python
+  scripts/benchmark.py --databases` measures it on your server.
+- **No effect on SQLite.** In-memory databases are one per process already, and
+  create mode gives each xdist worker a file of its own; the header says
+  `database=run (no effect on SQLite)`. Any other dialect is refused.
+
+The usual way to do this by hand, a session fixture that drops and recreates
+one test database, breaks under pytest-xdist: every worker runs it and drops
+the database the others are using. The suite runs that fixture as a control,
+with four workers whose tests overlap: it fails, and the same tests pass with
+`sqla_database = run`.
 
 ## Async details
 
@@ -477,9 +560,10 @@ tables (MyISAM, MEMORY) cannot be rolled back at all.
 
 ## pytest-xdist
 
-PostgreSQL and MySQL workers of one run share one database; SQLite workers
-each get their own, a file per worker in create mode and an in-memory database
-per process. Under the default isolation levels a worker never reads another
+PostgreSQL and MySQL workers of one run share one database, the configured one
+or, with `sqla_database = run`, the run's own; with `sqla_database = worker`
+each has its own. SQLite workers each get their own, a file per worker in
+create mode and an in-memory database per process. Under the default isolation levels a worker never reads another
 worker's rows, because no test commits; pytest-sqla refuses `READ UNCOMMITTED`
 for that reason. The schema is created by the first worker under a database
 lock (`pg_advisory_xact_lock` on PostgreSQL, `GET_LOCK` on MySQL), joined by
@@ -493,12 +577,13 @@ Limits:
   test ends, and two that insert the same values in opposite orders deadlock:
   measured on every run, with PostgreSQL's DeadlockDetected and MySQL's 1213.
   Make such values unique per test, or insert them in one order.
-- One run per database: a second pytest run on the same database while the
-  first is going gets SchemaConflictError. Per-run databases are on the
-  roadmap.
+- One run per configured database: a second pytest run on the same database
+  while the first is going gets SchemaConflictError. `sqla_database = run`
+  gives each run its own.
 - A worker that crashes never leaves, so its run's tables stay behind, a
   per-worker SQLite file included, and the next run asks for
-  `--sqla-recreate-schema`.
+  `--sqla-recreate-schema`. With `sqla_database = run` or `worker` the run's
+  database stays instead, and the next run names it.
 - Schema locks exist for PostgreSQL, MySQL, MariaDB and SQLite. Any other
   dialect works in a single process; under xdist, create the schema beforehand
   and set `sqla_schema = none`.
@@ -523,7 +608,9 @@ setup. Three exception classes, all subclasses of `pytest_sqla.PytestSqlaError`:
 - **SchemaConflictError**, from `sqla_schema`: on every database test for
   tables it did not create, another run's schema, or a lock that timed out
   during creation; once, at the end of the run, for a drop blocked by a leaked
-  transaction.
+  transaction. With `sqla_database = run` or `worker`, also for a database it
+  may not create, one with the run's name that is not its own, and its lock or
+  its drop timing out.
 
 A test's own failure always wins: a breach found at teardown is reported as a
 separate error and never replaces it. URLs in messages always hide the
@@ -541,15 +628,17 @@ password.
 | pytest-sqlalchemy | `--sqlalchemy-connect-url` | `--sqla-url` |
 | | `connection`, `transaction` | `sqla_connection` |
 | | `dbsession` | `sqla_session` |
-| | `--sqlalchemy-manage-db`, `db_schema` | `sqla_schema` creates tables, not the database |
+| | `--sqlalchemy-manage-db`, `db_schema` | `sqla_database = worker`, and `sqla_schema` for the tables |
 | sqlalchemyseed | your `engine` fixture, the SQLite listeners, StaticPool | `sqla_url`; delete the rest |
 | | `sqlalchemyseed_session` | override it to return `sqla_session`, and keep `seed` |
 
-pytest-sqla never creates or drops a database: pytest-sqlalchemy's `db_schema`
-and pytest-async-sqlalchemy's `database` fixture did, per xdist worker in the
-former's case. Create the database before the run, or supply it from a
-container fixture as below; all workers of a run share it (per-worker
-databases are on the roadmap).
+pytest-sqlalchemy's `db_schema` and pytest-async-sqlalchemy's `database`
+fixture created and dropped the database, per xdist worker in the former's
+case. `sqla_database = worker` does that, `run` creates one for the whole run,
+and `sqla_url` then names a database the user can connect to, such as
+`postgres`. In configured mode, the default, pytest-sqla never creates or drops
+a database: create it before the run, or supply it from a container fixture
+as below.
 
 ## Using it with database fixtures
 
@@ -569,7 +658,9 @@ def sqla_url():
 
 Everything that depends on `sqla_url`, the schema's drop included, is torn
 down before the container stops. pytest-databases and pytest-postgresql
-fixtures plug in the same way.
+fixtures plug in the same way. With `sqla_database = run` or `worker`, the
+override is the server and the name to derive from: pytest-sqla creates its
+database next to the container's.
 
 ## Limitations
 
@@ -593,6 +684,9 @@ fixtures plug in the same way.
   your own, or a class, module, package or session loop, shares connections
   between tests (see Pooling).
 - CREATE SCHEMA for schema-qualified metadata is up to you.
+- On MySQL a database `sqla_database` created holds one table more than your
+  schema, its mark, `pytest_sqla_database`, and pytest-sqla refuses a metadata
+  table of that name.
 
 ## Compatibility
 
@@ -604,10 +698,9 @@ fixtures plug in the same way.
 
 ## Roadmap
 
-Alembic as a schema mode, under the same lock; per-run and per-worker
-databases on PostgreSQL and MySQL; data seeded once per module inside an outer
-savepoint; rebinding an application's own sessionmaker; factory_boy and
-polyfactory helpers; a docs site.
+Alembic as a schema mode, under the same lock; data seeded once per module
+inside an outer savepoint; rebinding an application's own sessionmaker;
+factory_boy and polyfactory helpers; a docs site.
 
 ## License
 

@@ -180,7 +180,8 @@ isolation fails, at its own teardown, saying why.
   per backend. PostgreSQL uses `pg_advisory_xact_lock`, MySQL `GET_LOCK`,
   SQLite `BEGIN IMMEDIATE`; any other dialect refuses xdist (F15).
 - **Every wait is bounded.** `sqla_lock_timeout` bounds the schema lock, the
-  DDL lock waits of creation and drop alike, and an async test's teardown.
+  DDL lock waits of creation and drop alike, the lock and the DROP of a
+  database `sqla_database` created, and an async test's teardown.
   Measured: a drop behind a leaked transaction failed after 2.0 s with
   sqlstate 55P03 and MySQL 1205, and without a timeout it blocked forever;
   `--sqla-recreate-schema` behind a live run failed with the same raw errors
@@ -191,8 +192,40 @@ isolation fails, at its own teardown, saying why.
   even after rollback and close, and pytest keeps the last failure's
   traceback: one failing test made the session-end DROP wait out the whole
   lock timeout. In-memory databases go with their keeper; per-worker files are
-  deleted; a file the user named still has its tables dropped.
+  deleted; a database `sqla_database` created is dropped with its tables in
+  it; a file the user named still has its tables dropped.
 - **Never delete a file the user named.** Only the derived `-gwN` files.
+- **Drop a database only when all three hold.** `sqla_database = run` and
+  `worker` create `<db>_<run8>` and `<db>_<run8>_<gwN>` on the configured
+  server, from an AUTOCOMMIT NullPool connection to the configured database
+  (CREATE and DROP DATABASE run in no transaction block). Right before a DROP,
+  under the lock: the name derives from this run's id (an `Owned`, never a
+  name from elsewhere), the database carries pytest-sqla's mark, and the
+  mark's run id is this run's. The mark is the database's comment on
+  PostgreSQL; MySQL 8.4 has no comment on a database, so there it is a
+  one-row `pytest_sqla_database` table inside. A database with the name but
+  not the mark is refused at creation and left alone at the end. Measured: a
+  fixture that drops and creates one test database in every worker fails
+  under `-n 4`; `run` passes.
+- **One lock per database name, held across the whole step.** Create-or-join
+  and leave-then-drop each run under a session-level lock on the configured
+  database, `pg_advisory_lock` or `GET_LOCK`, keyed by the derived name, so
+  a late worker either joins a live database or creates it again, never one
+  being dropped, and separate runs never wait for each other. The mark counts
+  the workers inside; the one that brings it to 0 drops. Every fixture that
+  connects depends on the one that drops, so pytest-sqla's own engines,
+  pooled ones included, are disposed before the DROP (measured: no session
+  left on the database). PostgreSQL 13+ drops `WITH (FORCE)`, after ending the
+  database's sessions as earlier versions need; MySQL's DROP waits for a
+  leaked transaction, bounded by `lock_wait_timeout`.
+- **Check names before the run.** PostgreSQL cuts a name past 63 bytes with
+  only a NOTICE (measured), so two derived names could become one; MySQL
+  takes 64 characters. A name too long is a usage error, checked by the xdist
+  controller for its longest worker id, because a worker that fails its own
+  configure is replaced by xdist rather than reported (measured).
+- **One run id per run.** The xdist controller hands its own to every worker
+  through `pytest_configure_node`, so every name derived from it agrees, the
+  report header's included, which xdist prints before it makes its own.
 
 ### 3. Breaches are errors in the test that caused them
 
@@ -213,15 +246,21 @@ isolation fails, at its own teardown, saying why.
 
 ### 4. Public API
 
-- Fixtures: `sqla_url`, `sqla_async_url`, `sqla_metadata`,
-  `sqla_engine_options`, `sqla_session_options`, `sqla_schema`,
-  `sqla_connection`, `sqla_sessionmaker`, `sqla_session`,
-  `sqla_async_connection`, `sqla_async_sessionmaker`, `sqla_async_session`.
-  Every fixture whose name starts with `_sqla_` is internal and may change.
-- Options: `--sqla-url`, `--sqla-async-url`, `--sqla-recreate-schema`; the
-  `PYTEST_SQLA_URL` and `PYTEST_SQLA_ASYNC_URL` variables; the `sqla_url`,
-  `sqla_async_url`, `sqla_metadata`, `sqla_schema` and `sqla_lock_timeout` ini
-  keys. Precedence is command line, then environment, then ini.
+- Fixtures: `sqla_url`, `sqla_async_url`, `sqla_database_url`,
+  `sqla_async_database_url`, `sqla_metadata`, `sqla_engine_options`,
+  `sqla_session_options`, `sqla_schema`, `sqla_connection`,
+  `sqla_sessionmaker`, `sqla_session`, `sqla_async_connection`,
+  `sqla_async_sessionmaker`, `sqla_async_session`. `sqla_database_url` and
+  its async twin are what pytest-sqla connects to, read-only in spirit: the
+  way to choose the database is `sqla_url`. Every fixture whose name starts
+  with `_sqla_` is internal and may change.
+- Options: `--sqla-url`, `--sqla-async-url`, `--sqla-recreate-schema`,
+  `--sqla-keep-database`; the `PYTEST_SQLA_URL` and `PYTEST_SQLA_ASYNC_URL`
+  variables; the `sqla_url`, `sqla_async_url`, `sqla_metadata`,
+  `sqla_schema`, `sqla_database` and `sqla_lock_timeout` ini keys.
+  Precedence is command line, then environment, then ini.
+- The report header's `sqla:` line, and its `database=` value: the mode, and
+  the name when the configuration determines it.
 - Exceptions, all in `pytest_sqla.__all__`: `PytestSqlaError`,
   `SchemaConflictError`, `IsolationError`, `LoopMismatchError` (also a
   `RuntimeError`).
@@ -273,7 +312,9 @@ backed by something that runs:
   skip: `SQLA_TEST_REQUIRE_ALL=1` turns a missing URL into a failure, and
   `scripts/check_no_skips.py` fails on a skip from any source.
 - **Controls.** Where a claim is "without this, X breaks", a test shows X
-  breaking without it: the SQLite leak, the default join mode, crossing loops.
+  breaking without it: the SQLite leak, the default join mode, crossing loops,
+  a database dropped and created by every worker, PostgreSQL cutting a long
+  name, a plain DROP with a session on the database.
 - **The examples dogfood the promise.** Each example's second test asserts the
   first test's commits were rolled back, on SQLite, PostgreSQL and MySQL.
 - **The floor is proven, not declared.** CI runs SQLAlchemy 2.0.0, pytest
