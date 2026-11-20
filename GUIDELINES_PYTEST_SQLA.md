@@ -240,6 +240,9 @@ isolation fails, at its own teardown, saying why.
   which it could not hand back empty. A migration that fails drops the
   database again, after the same three checks, so nobody joins one half
   migrated: a waiting worker creates it again and reports the error itself.
+  One that will not drop (measured on MySQL, behind a transaction the
+  migration left open) is marked as a failed migration's, which every worker
+  refuses.
   The connection goes to env.py idle, because a transaction of pytest-sqla's
   own buys nothing in a database it drops, and measured, it broke
   `autocommit_block()` with a bare AssertionError and, on SQLite, an env.py

@@ -35,15 +35,22 @@ any test connects.
   approves the connection record; ``connect``, inserted first, refuses a
   record ``do_connect`` never approved: an engine with ``creator=``, or an
   application's ``do_connect`` hook that returns a connection of its own
-  (``insert=True`` is ignored for ``do_connect``). Other threads pass
+  (``insert=True`` is ignored for ``do_connect``). It reads the arguments
+  again, because SQLAlchemy lets a ``do_connect`` hook change them in place,
+  and one on env.py's own engine runs after the guard's. Other threads pass
   untouched. On servers only the database's name is compared: it derives from
   the run's id, so host aliases such as localhost and 127.0.0.1 cannot cause a
-  false refusal.
+  false refusal. What it cannot see is a ``do_connect`` hook that runs after
+  its own, registered later or on env.py's engine, and returns a connection
+  of its own.
 * Logging. env.py's ``fileConfig()`` closes every handler, pytest's included,
   replaces the root logger's, and disables every logger its file does not
   name. The configuration from before is restored afterwards, and the
   FileHandlers it closed are reopened in append mode: otherwise caplog stays
-  empty, and pytest's ``--log-file`` gets nothing more.
+  empty, and pytest's ``--log-file`` gets nothing more. A logger created
+  during the build is reset to what ``getLogger`` makes, and a handler first
+  attached during it is closed, including those of a module env.py imports
+  for the first time; the tests usually import the application first.
 * Paths. Alembic resolves a relative ``script_location``,
   ``prepend_sys_path`` or ``version_locations`` against the working
   directory; pytest-sqla resolves them against the config file's directory,
@@ -64,7 +71,7 @@ import logging
 import os
 import sys
 import threading
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NoReturn
@@ -161,9 +168,10 @@ def plan(
     if make_url(rendered) != url:
         pytest.fail(
             "pytest-sqla: sqla_schema = alembic hands env.py the URL as text, in the "
-            f"sqlalchemy.url option, and {render(url)} does not read back as the same URL. "
-            "SQLAlchemy before 2.0.24 changes %XX in a password when it writes a URL out: "
-            "upgrade SQLAlchemy to 2.0.24 or newer, or use a password without %.",
+            f"sqlalchemy.url option, and {render(url)} does not read back as the same URL, so "
+            "env.py would connect with another one. SQLAlchemy writes out no password without "
+            "a user name, and before 2.0.24 it changes %XX in a password: give the URL a user "
+            "name, use a password without %, or upgrade SQLAlchemy to 2.0.24 or newer.",
             pytrace=False,
         )
     sync = targets.sync
@@ -364,32 +372,40 @@ class _Guard:
         self,
         dialect: Dialect,
         record: ConnectionPoolEntry,
-        cargs: tuple[Any, ...],
+        cargs: Sequence[Any],
         cparams: dict[str, Any],
     ) -> None:
         if threading.get_ident() != self.thread:
             return
-        reached = _database_of(dialect, cargs, cparams)
-        if reached != self.expected:
-            self._refuse(
-                f"pytest-sqla: env.py or a migration opened a {dialect.name}+{dialect.driver} "
-                f"connection to {reached!r}, and sqla_schema = alembic migrates "
-                f"{render(self.url)} only, so pytest-sqla refused it before it was used."
-            )
-        record.info[_APPROVED] = True
+        if _database_of(dialect, cargs, cparams) != self.expected:
+            self._refuse(self._elsewhere(dialect, cargs, cparams))
+        # The arguments themselves: a later do_connect hook may still change them in place.
+        record.info[_APPROVED] = (dialect, cargs, cparams)
 
     def connect(self, dbapi_connection: DBAPIConnection, record: ConnectionPoolEntry) -> None:
-        if threading.get_ident() != self.thread or record.info.pop(_APPROVED, False):
+        if threading.get_ident() != self.thread:
+            return
+        approved = record.info.pop(_APPROVED, None)
+        if approved is not None and _database_of(*approved) == self.expected:
             return
         # SQLAlchemy 2.0.0 leaves a connection its connect event refused open.
         with contextlib.suppress(Exception):
             dbapi_connection.close()
+        if approved is not None:
+            self._refuse(self._elsewhere(*approved))
         self._refuse(
             "pytest-sqla: refused a connection of the migration that SQLAlchemy did not make "
             "from its connect arguments: an engine made with creator=, or a do_connect hook "
             "that returns a connection of its own, such as an application's. pytest-sqla could "
             "not tell which database it reaches, and sqla_schema = alembic migrates "
             f"{render(self.url)} only."
+        )
+
+    def _elsewhere(self, dialect: Dialect, cargs: Sequence[Any], cparams: Mapping[str, Any]) -> str:
+        return (
+            f"pytest-sqla: env.py or a migration opened a {dialect.name}+{dialect.driver} "
+            f"connection to {_database_of(dialect, cargs, cparams)!r}, and sqla_schema = alembic "
+            f"migrates {render(self.url)} only, so pytest-sqla refused it before it was used."
         )
 
     def _refuse(self, message: str) -> NoReturn:
@@ -405,8 +421,13 @@ class _Guard:
             raise self.refusal
 
 
-def _database_of(dialect: Dialect, cargs: tuple[Any, ...], cparams: Mapping[str, Any]) -> object:
-    """The database a driver is about to open, read from its connect arguments."""
+def _database_of(dialect: Dialect, cargs: Sequence[Any], cparams: Mapping[str, Any]) -> object:
+    """The database a driver is about to open, read from its connect arguments.
+
+    SQLAlchemy hands every do_connect listener the same ``cargs`` list and
+    ``cparams`` dict, which a listener may change in place, then connects with
+    them.
+    """
     if dialect.name == "sqlite":
         return cargs[0] if cargs else None
     return next((cparams[key] for key in _DATABASE_KEYS if key in cparams), None)

@@ -586,6 +586,49 @@ def alembic_project_env(project: Project, env: str) -> None:
     (project.path / "migrations" / "env.py").write_text(textwrap.dedent(env).lstrip())
 
 
+REWRITING_ENV = """
+from alembic import context
+from sqlalchemy import engine_from_config, event, pool
+
+config = context.config
+engine = engine_from_config(
+    config.get_section(config.config_ini_section, {}), prefix="sqlalchemy.", poolclass=pool.NullPool
+)
+
+
+@event.listens_for(engine, "do_connect")
+def elsewhere(dialect, record, cargs, cparams):
+    # SQLAlchemy lets a hook change the arguments in place, and this one runs after the guard's.
+    cargs[0] = OTHER_PATH
+
+
+with engine.connect() as connection:
+    context.configure(connection=connection)
+    with context.begin_transaction():
+        context.run_migrations()
+engine.dispose()
+"""
+
+
+def test_a_do_connect_hook_that_points_env_pys_engine_elsewhere_is_refused(
+    project: Project,
+) -> None:
+    """The guard's do_connect approved the arguments, which the hook changed afterwards; its
+    connect listener reads them again, and refuses."""
+    other = project.path / "other.db"
+    alembic_project(project, env=REWRITING_ENV.replace("OTHER_PATH", repr(str(other))))
+    result = errors(project)
+    result.stdout.fnmatch_lines(
+        [
+            f"*SchemaConflictError: pytest-sqla: env.py or a migration opened a sqlite+pysqlite "
+            f"connection to {str(other)!r}, and sqla_schema = alembic migrates "
+            "sqlite:///file*/pytest-sqla-*?uri=true&vfs=memdb only, so pytest-sqla refused it "
+            "before it was used.*"
+        ]
+    )
+    assert sqlite_rows(other, "SELECT name FROM sqlite_master") == [], "nothing ran there"
+
+
 ANOTHER_THREAD = """
 import threading
 
@@ -639,9 +682,10 @@ def test_a_url_that_does_not_read_back_whole_is_refused_before_anything_connects
         [
             "*pytest-sqla: sqla_schema = alembic hands env.py the URL as text, in the "
             "sqlalchemy.url option, and postgresql+psycopg://db.example/app_* does not read "
-            "back as the same URL. SQLAlchemy before 2.0.24 changes %XX in a password when it "
-            "writes a URL out: upgrade SQLAlchemy to 2.0.24 or newer, or use a password "
-            "without %."
+            "back as the same URL, so env.py would connect with another one. SQLAlchemy writes "
+            "out no password without a user name, and before 2.0.24 it changes %XX in a "
+            "password: give the URL a user name, use a password without %, or upgrade "
+            "SQLAlchemy to 2.0.24 or newer."
         ]
     )
     assert "s3cret" not in result.stdout.str()

@@ -76,6 +76,9 @@ from ._engines import admin_engine, async_admin_engine
 from ._schema import DATABASE_MARK_NAME, in_thread, lock_timed_out
 
 MARK_NAME = DATABASE_MARK_NAME
+FAILED_RUN_ID = "pytest-sqla:failed-migration"
+"""The run id in the mark of a database whose migration failed and that would not drop:
+no run has it, so every worker refuses the database instead of joining it."""
 _COMMENT = re.compile(r"pytest-sqla run_id=(\S+) workers=(\d+) started_at=(\S+) owner=(\S+)")
 
 _T = TypeVar("_T")
@@ -244,9 +247,14 @@ _OTHERS_MYSQL = text(
 )
 
 
+def _seconds(owned: Owned) -> int:
+    """sqla_lock_timeout in the whole seconds MySQL takes."""
+    return max(1, math.ceil(owned.lock_timeout))
+
+
 class _MySQL(_Server):
     def lock(self, connection: Connection, owned: Owned) -> None:
-        seconds = max(1, math.ceil(owned.lock_timeout))
+        seconds = _seconds(owned)
         # Bounds the metadata lock waits of CREATE and DROP; this connection only.
         connection.exec_driver_sql(f"SET SESSION lock_wait_timeout = {seconds}")
         if connection.scalar(select(func.get_lock(lock_name(owned.name), seconds))) != 1:
@@ -267,7 +275,7 @@ class _MySQL(_Server):
         connection.execute(table.insert().values(**asdict(mark)))
 
     def mark(self, connection: Connection, name: str, mark: Mark) -> None:
-        connection.execute(mark_table(name).update().values(workers=mark.workers))
+        connection.execute(mark_table(name).update().values(**asdict(mark)))
 
     def drop(self, connection: Connection, owned: Owned) -> None:
         connection.exec_driver_sql(f"DROP DATABASE {_quoted(connection, owned.name)}")
@@ -276,8 +284,12 @@ class _MySQL(_Server):
         # Another run's DROP holds the locks on its tables until it ends: a mark not
         # readable within a second is skipped, never a reason for this run to wait or fail.
         connection.exec_driver_sql("SET SESSION lock_wait_timeout = 1")
-        names = connection.scalars(_OTHERS_MYSQL, {"pattern": name_pattern(owned)}).all()
-        return [(name, self._readable_mark(connection, name)) for name in names]
+        try:
+            names = connection.scalars(_OTHERS_MYSQL, {"pattern": name_pattern(owned)}).all()
+            return [(name, self._readable_mark(connection, name)) for name in names]
+        finally:
+            # sqla_lock_timeout again: a failed migration's DROP can still come on this session.
+            connection.exec_driver_sql(f"SET SESSION lock_wait_timeout = {_seconds(owned)}")
 
     def _readable_mark(self, connection: Connection, name: str) -> Mark | None:
         try:
@@ -344,10 +356,33 @@ def _build(
     """
     try:
         build()
-    except BaseException:
-        if _our_mark(connection, server, owned) is not None:
-            server.drop(connection, owned)
+    except BaseException as error:
+        mark = _our_mark(connection, server, owned)
+        if mark is not None:
+            _discard(connection, server, owned, mark, error)
         raise
+
+
+def _discard(
+    connection: Connection, server: _Server, owned: Owned, mark: Mark, error: BaseException
+) -> None:
+    """Drop the database a failed migration ran in; if it will not drop, mark it as failed.
+
+    Measured on MySQL: a connection the migration left in a transaction holds
+    the DROP until it times out. Still marked as this run's, the database would
+    then be joined, half migrated, by the next worker to take the lock;
+    marked as failed, every worker refuses it. The migration's own error stays
+    the one raised, with a note about the database.
+    """
+    try:
+        server.drop(connection, owned)
+    except DBAPIError as failure:
+        server.mark(connection, owned.name, replace(mark, run_id=FAILED_RUN_ID))
+        error.add_note(
+            f"pytest-sqla: the migration failed, and {render(owned.url)} could not be dropped "
+            f"afterwards, so it is marked as a failed migration's and no worker will use it. "
+            f"Drop it yourself once whatever holds it lets go. The driver reported: {failure.orig}"
+        )
 
 
 def _our_mark(connection: Connection, server: _Server, owned: Owned) -> Mark | None:
@@ -448,6 +483,12 @@ def _waited_too_long(owned: Owned, error: DBAPIError | None = None) -> SchemaCon
 
 
 def _not_ours(owned: Owned, mark: Mark | None) -> str:
+    if mark is not None and mark.run_id == FAILED_RUN_ID:
+        return (
+            f"pytest-sqla: the database {render(owned.url)} is what a migration that failed "
+            f"left behind, started {mark.started_at} by {mark.owner}, and could not be dropped. "
+            "pytest-sqla will neither use nor drop it; drop it yourself, then run again."
+        )
     whose = (
         "does not carry pytest-sqla's mark"
         if mark is None

@@ -446,7 +446,10 @@ so one that fails, or stops half way, leaves nothing that anything uses:
   DATABASE`, under the database lock. The others wait on the lock, at most
   `sqla_lock_timeout`, and join a migrated database. A migration that fails
   drops the database again, so a worker that was waiting creates it once
-  more, migrates it, and reports the same error itself. With `run`, raise
+  more, migrates it, and reports the same error itself. One that will not
+  drop, such as on MySQL behind a transaction the migration left open, is
+  marked as a failed migration's instead, and every worker refuses it, the
+  error saying so. With `run`, raise
   `sqla_lock_timeout` above the time your migrations take, or use `worker`,
   where each worker migrates a database of its own.
 - **SQLite in memory**, such as `sqla_url = sqlite://`, once per session. A
@@ -484,7 +487,10 @@ and `create_all` stays the quick path on a laptop.
   connection they open to any other database is refused before it is used,
   such as an env.py that prefers the application's own `DATABASE_URL`, and
   so is one SQLAlchemy did not make from its connect arguments, such as an
-  engine with `creator=`. Connections other threads open meanwhile pass.
+  engine with `creator=`, or one whose arguments a `do_connect` hook changed
+  after pytest-sqla read them. Connections other threads open meanwhile pass.
+  What it cannot see is a `do_connect` hook that runs after its own and
+  returns a connection it made itself.
 - **The configuration** is `sqla_alembic_config`, relative to the rootdir,
   `alembic.ini` by default; the `pyproject.toml` next to it is read too, for
   what its `[tool.alembic]` table sets, and a `.toml` path is a
@@ -524,7 +530,9 @@ and `create_all` stays the quick path on a laptop.
 
 On MySQL the database also holds pytest-sqla's mark, the
 `pytest_sqla_database` table, next to your migrations' tables and
-`alembic_version`. [The example](https://github.com/sqla-native/pytest-sqla/tree/main/examples/alembic_app)
+`alembic_version`: a test that compares your models with the migrated
+database, such as one built on `compare_metadata`, should leave it out with
+its `include_object`. [The example](https://github.com/sqla-native/pytest-sqla/tree/main/examples/alembic_app)
 runs in CI on SQLite, PostgreSQL and MySQL.
 
 ## Async details

@@ -36,7 +36,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   under the database lock, and the others join it migrated; on SQLite, an
   in-memory database is migrated once per session. A migration that fails
   drops its database again, so no worker joins one half migrated, and a
-  waiting worker that tries again reports the same error. A configured
+  waiting worker that tries again reports the same error; a database that
+  will not drop is marked as a failed migration's, and every worker refuses
+  it. A configured
   database or a SQLite file is a usage error, and so is an in-memory URI that
   gives each connection its own database, as in create mode. `sqla_metadata`
   is ignored, so one configuration serves both modes.

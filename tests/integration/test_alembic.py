@@ -25,7 +25,7 @@ from sqlalchemy import create_engine, func, select
 from sqlalchemy.engine import make_url
 from sqlalchemy.pool import NullPool
 
-from pytest_sqla._database import lock_key, lock_name
+from pytest_sqla._database import FAILED_RUN_ID, lock_key, lock_name
 from tests.alembic_kit import (
     APP_DATABASE_ENV,
     ASYNC_DOGFOOD,
@@ -38,11 +38,13 @@ from tests.alembic_kit import (
 from tests.helpers import Project, table_names
 from tests.integration.conftest import Database, sync_twin
 from tests.integration.test_databases import (
+    LEAK_CONFTEST,
     LOG_STATEMENTS,
     RUN_ID,
     configured,
     drop_databases,
     owned_databases,
+    read_mark,
     run_database,
     with_database,
 )
@@ -125,27 +127,50 @@ def test_the_async_template_migrates_the_run_database(
 
 # --------------------------------------------------- CREATE INDEX CONCURRENTLY
 
-CONCURRENTLY = '''
-"""an index built concurrently, which runs in no transaction block"""
+# For a migration that must run while another worker waits on the database lock:
+# it waits until one does, so the overlap is proven, not assumed.
+WAITER = """
 import time
 
+import sqlalchemy as sa
+
+WAITING = {
+    "postgresql": "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND NOT granted",
+    "mysql": "SELECT count(*) FROM information_schema.processlist WHERE state = 'User lock'",
+}
+
+
+def wait_for_a_waiter(bind):
+    deadline = time.monotonic() + 60
+    while not bind.scalar(sa.text(WAITING[bind.dialect.name])):
+        assert time.monotonic() < deadline, "no other worker waited on the lock"
+        time.sleep(0.1)
+"""
+
+CONCURRENTLY = (
+    '''
+"""an index built concurrently, which runs in no transaction block"""
 from alembic import op
 
 revision = "0002"
 down_revision = "0001"
 branch_labels = None
 depends_on = None
-
+'''
+    + WAITER
+    + """
 
 def upgrade():
-    time.sleep(SLEEP)  # long enough for a second worker to wait on the lock meanwhile
+    if SHOULD_WAIT:
+        wait_for_a_waiter(op.get_bind())
     with op.get_context().autocommit_block():
         op.create_index("ix_note_body", "note", ["body"], postgresql_concurrently=True)
 
 
 def downgrade():
     pass
-'''
+"""
+)
 
 INDEX_TESTS = """
 from sqlalchemy import text
@@ -186,7 +211,7 @@ def test_an_autocommit_block_builds_an_index_concurrently(
     alembic_project(
         project,
         env=env,
-        revisions=(MIGRATION, CONCURRENTLY.replace("SLEEP", "0")),
+        revisions=(MIGRATION, CONCURRENTLY.replace("SHOULD_WAIT", "False")),
         tests=INDEX_TESTS,
     )
     run(project, postgresql_database).assert_outcomes(passed=1)
@@ -199,7 +224,7 @@ def test_the_async_template_builds_an_index_concurrently(
     alembic_project(
         project,
         template="async",
-        revisions=(MIGRATION, CONCURRENTLY.replace("SLEEP", "0")),
+        revisions=(MIGRATION, CONCURRENTLY.replace("SHOULD_WAIT", "False")),
         tests=ASYNC_INDEX_TESTS,
     )
     run(project, asyncpg_database).assert_outcomes(passed=1)
@@ -209,12 +234,13 @@ def test_the_async_template_builds_an_index_concurrently(
 def test_an_index_built_concurrently_while_another_worker_waits_on_the_lock(
     project: Project, postgresql_database: Database
 ) -> None:
-    """The waiting worker is inside a statement on the configured database, which has a
-    snapshot; CREATE INDEX CONCURRENTLY waits for older snapshots of its own database only,
-    so it must not wait for that worker, which waits for it."""
+    """The migration waits until the other worker waits on the lock, inside a statement on
+    the configured database, which has a snapshot. CREATE INDEX CONCURRENTLY waits for older
+    snapshots of its own database only, so it must not wait for that worker, which waits for
+    it."""
     alembic_project(
         project,
-        revisions=(MIGRATION, CONCURRENTLY.replace("SLEEP", "2")),
+        revisions=(MIGRATION, CONCURRENTLY.replace("SHOULD_WAIT", "True")),
         tests=WRITERS + INDEX_TESTS,
     )
     project.ini(sqla_database="run", sqla_lock_timeout="60")
@@ -225,25 +251,28 @@ def test_an_index_built_concurrently_while_another_worker_waits_on_the_lock(
 
 # ------------------------------------------------------------- pytest-xdist
 
-COUNTED = '''
+COUNTED = (
+    '''
 """user_account and note, and a line per run of the migration"""
 import os
-import time
 from pathlib import Path
 
-import sqlalchemy as sa
 from alembic import op
 
 revision = "0001"
 down_revision = None
 branch_labels = None
 depends_on = None
-
+'''
+    + WAITER
+    + """
 
 def upgrade():
+    bind = op.get_bind()
+    if SHOULD_WAIT:
+        wait_for_a_waiter(bind)
     with Path(COUNT_PATH).open("a") as count:
-        count.write(f"{os.getpid()} {op.get_bind().engine.url.database}\\n")
-    time.sleep(2)  # the other worker asks for the database meanwhile
+        count.write(f"{os.getpid()} {bind.engine.url.database}\\n")
     op.create_table(
         "user_account",
         sa.Column("id", sa.Integer, primary_key=True),
@@ -259,11 +288,13 @@ def upgrade():
 
 def downgrade():
     pass
-'''
+"""
+)
 
 
-def counted(count: Path) -> str:
-    return COUNTED.replace("COUNT_PATH", repr(str(count)))
+def counted(count: Path, *, wait: bool) -> str:
+    """The migration, writing a line per run; ``wait`` holds it until another worker waits."""
+    return COUNTED.replace("COUNT_PATH", repr(str(count))).replace("SHOULD_WAIT", str(wait))
 
 
 def statements(log: Path) -> list[tuple[str, str]]:
@@ -278,11 +309,11 @@ def statements(log: Path) -> list[tuple[str, str]]:
 def test_a_run_database_is_migrated_once_while_the_other_workers_wait(
     project: Project, sync_database: Database
 ) -> None:
-    """Both workers ask for the database at once; the one that takes the lock creates and
-    migrates it, the other waits on the lock and joins a migrated database: every test sees
-    the tables, and the migration ran once."""
+    """The worker that takes the lock creates the database, and its migration goes on only
+    once the other worker waits on the lock: that one then joins a migrated database, every
+    test sees the tables, and the migration ran once."""
     count, log = project.path / "migrated.txt", project.path / "statements.log"
-    alembic_project(project, revisions=(counted(count),), tests=WRITERS)
+    alembic_project(project, revisions=(counted(count, wait=True),), tests=WRITERS)
     project.conftest(LOG_STATEMENTS.replace("LOG_PATH", repr(str(log))))
     project.ini(sqla_database="run")
     result = project.run_subprocess("-n", "2", "--sqla-url", sync_database.url, timeout=300)
@@ -316,7 +347,7 @@ def test_in_worker_mode_each_worker_migrates_a_database_of_its_own(
     names.mkdir()
     alembic_project(
         project,
-        revisions=(counted(count),),
+        revisions=(counted(count, wait=False),),
         tests=WORKER_NAMES.replace("NAMES_PATH", repr(str(names))),
     )
     project.ini(sqla_database="worker")
@@ -384,6 +415,72 @@ def test_keep_database_keeps_a_migrated_database_and_still_drops_a_failed_one(
     assert owned_databases(sync_database) == [run_database(sync_database)]
     kept = with_database(sync_database, run_database(sync_database))
     assert {"alembic_version", "note", "user_account"} <= set(table_names(sync_twin(kept.url)))
+
+
+LEAKS_THEN_FAILS = '''
+"""leaves a transaction open on a table of its database, then fails"""
+import sqlalchemy as sa
+from alembic import op
+from sqlalchemy.pool import NullPool
+
+revision = "0002"
+down_revision = "0001"
+branch_labels = None
+depends_on = None
+
+
+def upgrade():
+    from conftest import LEAKED  # the inner conftest closes it when the session ends
+
+    engine = sa.create_engine(op.get_bind().engine.url, poolclass=NullPool)
+    connection = engine.connect()
+    connection.execute(sa.text("SELECT count(*) FROM user_account"))
+    LEAKED.append((connection, engine))
+    raise RuntimeError("migration 0002 left a transaction open, then failed")
+
+
+def downgrade():
+    pass
+'''
+
+
+def test_a_failed_migrations_database_that_will_not_drop_is_marked_and_refused(
+    project: Project, mysql_database: Database, run_id: str
+) -> None:
+    """MySQL's DROP waits for the transaction the migration left open, at most
+    sqla_lock_timeout, and fails. Marked as this run's, the database would be joined half
+    migrated by the next worker to take the lock; marked as a failed migration's, it is
+    refused. PostgreSQL drops it WITH (FORCE), ending that session."""
+    name = run_database(mysql_database)
+    alembic_project(project, revisions=(MIGRATION, LEAKS_THEN_FAILS))
+    project.conftest(LEAK_CONFTEST)
+    project.ini(sqla_lock_timeout="2")
+    result = run(project, mysql_database)
+    result.assert_outcomes(errors=3)
+    result.stdout.fnmatch_lines(
+        [
+            "E * RuntimeError: migration 0002 left a transaction open, then failed",
+            f"E * pytest-sqla: the migration failed, and *{name} could not be dropped "
+            "afterwards, so it is marked as a failed migration's and no worker will use it. "
+            "Drop it yourself once whatever holds it lets go. The driver reported: (1205, *",
+        ]
+    )
+    assert owned_databases(mysql_database) == [name]
+    mark = read_mark(mysql_database, name)
+    assert mark is not None
+    assert mark.run_id == FAILED_RUN_ID
+
+    (project.path / "test_inner.py").write_text("def test_db(sqla_session):\n    pass\n")
+    sibling = run(project, mysql_database)
+    sibling.assert_outcomes(errors=1)
+    sibling.stdout.fnmatch_lines(
+        [
+            f"*SchemaConflictError: pytest-sqla: the database *{name} is what a migration that "
+            "failed left behind, started * by *, and could not be dropped. pytest-sqla will "
+            "neither use nor drop it; drop it yourself, then run again."
+        ]
+    )
+    assert owned_databases(mysql_database) == [name], "refused, not joined and not dropped"
 
 
 REMARKED = '''
@@ -618,7 +715,11 @@ def test_a_password_with_percent_escapes_reaches_env_py_whole(
             [
                 "*pytest-sqla: sqla_schema = alembic hands env.py the URL as text, in the "
                 f"sqlalchemy.url option, and postgresql+psycopg://{PERCENT_ROLE}:***@*/"
-                f"{run_database(postgresql_database)} does not read back as the same URL.*"
+                f"{run_database(postgresql_database)} does not read back as the same URL, so "
+                "env.py would connect with another one. SQLAlchemy writes out no password "
+                "without a user name, and before 2.0.24 it changes %XX in a password: give the "
+                "URL a user name, use a password without %, or upgrade SQLAlchemy to 2.0.24 or "
+                "newer."
             ]
         )
     assert password not in result.stdout.str()
