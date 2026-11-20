@@ -111,6 +111,36 @@ def test_an_in_memory_async_only_url_works_too(project: Project) -> None:
     project.run().assert_outcomes(passed=2)
 
 
+def test_a_private_in_memory_async_url_in_none_mode_is_each_tests_own(project: Project) -> None:
+    """As on the sync side: no keeper, and the plain BEGIN of an in-memory database."""
+    project.ini(
+        sqla_async_url="sqlite+aiosqlite:///file:app?mode=memory&uri=true", sqla_schema="none"
+    )
+    project.tests(
+        """
+        import pytest
+        from sqlalchemy import event, inspect, text
+        from pytest_sqla import _sqlite
+
+        def tables(connection):
+            return inspect(connection).get_table_names()
+
+        @pytest.mark.asyncio
+        async def test_builds_its_own_table(sqla_async_connection, _sqla_sqlite_keeper):
+            assert _sqla_sqlite_keeper is None
+            engine = sqla_async_connection.engine.sync_engine
+            assert event.contains(engine, "begin", _sqlite.begin)
+            await sqla_async_connection.execute(text("CREATE TABLE note (body TEXT)"))
+            assert await sqla_async_connection.run_sync(tables) == ["note"]
+
+        @pytest.mark.asyncio
+        async def test_the_next_test_starts_empty(sqla_async_connection):
+            assert await sqla_async_connection.run_sync(tables) == []
+        """
+    )
+    project.run().assert_outcomes(passed=2)
+
+
 # ------------------------------------------------------------- engine options
 
 ASYNC_TEST = """

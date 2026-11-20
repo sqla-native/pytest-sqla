@@ -39,6 +39,16 @@ feature" whose use "is discouraged", and measured, it fails at once with
 "database table is locked" where memdb waits out the busy timeout like a file.
 A keeper connection holds the database open for the session, because NullPool
 and ``dispose()`` would otherwise discard it with its last connection.
+
+**In-memory URIs of your own** are used as given, and SQLite decides whether
+connections share them. Measured with two connections to one URI, the first
+creating a table, on SQLite 3.53.1 and 3.54.0: ``mode=memory`` and the name
+``:memory:`` give each connection a private database, even on ``vfs=memdb``
+with a leading slash; ``vfs=memdb`` alone shares a name that begins with
+``/``; ``cache=shared`` shares either, unless the name is empty, which makes a
+temporary database. A shared one gets a keeper. A private one gets none, and
+``sqla_schema = create`` refuses it (see ``_config``): the tables it creates
+would be in the schema connection's database alone.
 """
 
 from __future__ import annotations
@@ -46,6 +56,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from pathlib import PurePath
 from typing import TYPE_CHECKING, Any
+from urllib.parse import unquote
 
 import pytest
 from sqlalchemy import event
@@ -78,16 +89,58 @@ def is_plain_memory(url: URL) -> bool:
     return is_sqlite(url) and not _uses_uri(url) and url.database in (None, "", ":memory:")
 
 
+def _uri_path(database: str) -> str:
+    """The name SQLite reads from a ``file:`` URI.
+
+    SQLite drops the authority, which may only be empty or ``localhost``, so
+    ``file:///x`` and ``file://localhost/x`` name ``/x``, and it decodes %HH
+    escapes, which SQLAlchemy 2.0 leaves in ``url.database``.
+    """
+    path = database.removeprefix("file:")
+    if path.startswith("//"):
+        _, slash, rest = path[2:].partition("/")
+        path = slash + rest
+    return unquote(path)
+
+
+def _shared(url: URL) -> bool | None:
+    """Whether every connection to the in-memory database ``url`` names sees the same one.
+
+    None when ``url`` names no in-memory database: not SQLite, not a URI, or a
+    file. Without ``file:``, sqlite3 opens the name as a plain filename, with
+    SQLAlchemy's parameters appended, so only ``:memory:`` itself is in memory.
+    """
+    if not (is_sqlite(url) and _uses_uri(url)):
+        return None
+    database = url.database or ""
+    if not database.startswith("file:"):
+        return False if keeper_target(url) == ":memory:" else None
+    path = _uri_path(database)
+    query = url.query
+    # SQLite's own in-memory database, which opens no file, so vfs=memdb changes nothing.
+    memory = path == ":memory:" or query.get("mode") == "memory"
+    if not (memory or query.get("vfs") == "memdb"):
+        return None
+    if query.get("cache") == "shared":
+        return bool(path)  # an empty name is a temporary database, shared with no one
+    # memdb shares a database "as long as the database name begins with '/'".
+    # Measured: the name "/" alone is private, and a leading backslash shares too.
+    return not memory and len(path) > 1 and path[0] in "/\\"
+
+
 def is_shared_memory(url: URL) -> bool:
     """An in-memory database that several connections can open by name."""
-    if not (is_sqlite(url) and _uses_uri(url)):
-        return False
-    database = url.database or ""
-    return (
-        url.query.get("mode") == "memory"
-        or url.query.get("vfs") == "memdb"
-        or database.startswith("file::memory:")
-    )
+    return _shared(url) is True
+
+
+def is_private_memory(url: URL) -> bool:
+    """An in-memory URI that gives every connection a new, empty database of its own."""
+    return _shared(url) is False
+
+
+def is_memory_uri(url: URL) -> bool:
+    """An in-memory database named by a URI, shared or private."""
+    return _shared(url) is not None
 
 
 def is_plain_file(url: URL) -> bool:

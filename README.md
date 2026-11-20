@@ -510,9 +510,14 @@ loop than its own scope's fixtures.
   the whole session, held open by a keeper connection, and shared between the
   sync and async engines. That needs SQLite 3.36 (2021) or newer.
   Shared-cache mode is not used: SQLite calls it obsolete, and it fails at
-  once where memdb waits for a lock like a file does. A shared-memory URL of
-  your own (`mode=memory`, `vfs=memdb`) is used as given, plus
-  `check_same_thread=False` on pysqlite, so a test can use it from a thread.
+  once where memdb waits for a lock like a file does. An in-memory URI of
+  your own (`uri=true`) is used as given, plus `check_same_thread=False` on
+  pysqlite, so a test can use it from a thread. SQLite shares
+  `file:/NAME?vfs=memdb`, and any of them with `cache=shared`, between
+  connections; `file:NAME?mode=memory`, `file::memory:` and
+  `file:NAME?vfs=memdb` give each connection its own empty database, as does
+  `mode=memory` next to `vfs=memdb`, so `sqla_schema = create` refuses them.
+  With `sqla_schema = none`, each test's connection has one of its own.
 - **Files.** A test's transaction on a SQLite file begins `IMMEDIATE`, in PEP
   249 mode too, so another process waits for it instead of failing with
   "database is locked". Under pytest-xdist in create mode, each worker gets a
