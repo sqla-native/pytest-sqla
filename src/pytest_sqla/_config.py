@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib
+import importlib.util
 import math
 import os
 import re
@@ -32,8 +33,11 @@ from sqlalchemy.exc import ArgumentError
 
 from . import _sqlite
 
-SCHEMA_MODES = ("create", "none")
+SCHEMA_MODES = ("create", "none", "alembic")
 DATABASE_MODES = ("configured", "run", "worker")
+ALEMBIC_URLS = ("sync", "async")
+DEFAULT_ALEMBIC_CONFIG = "alembic.ini"
+DEFAULT_ALEMBIC_TARGET = "heads"
 DEFAULT_LOCK_TIMEOUT = 30.0
 RUN_ID_KEY = "pytest_sqla_run_id"
 """The key under which an xdist controller hands its run id to every worker."""
@@ -54,6 +58,19 @@ _HEX = re.compile(r"[0-9a-f]{8}")
 _NAME_LIMITS = {"postgresql": 63, "mysql": 64, "mariadb": 64}
 _NAME_UNITS = {"postgresql": "bytes", "mysql": "characters", "mariadb": "characters"}
 _SERVERS = {"postgresql": "PostgreSQL", "mysql": "MySQL", "mariadb": "MariaDB"}
+# The drivers the error messages suggest, per backend.
+SYNC_DRIVERS = {
+    "postgresql": "postgresql+psycopg",
+    "mysql": "mysql+pymysql",
+    "mariadb": "mariadb+pymysql",
+    "sqlite": "sqlite",
+}
+ASYNC_DRIVERS = {
+    "postgresql": "postgresql+asyncpg",
+    "mysql": "mysql+aiomysql",
+    "mariadb": "mariadb+aiomysql",
+    "sqlite": "sqlite+aiosqlite",
+}
 
 
 @dataclass(frozen=True)
@@ -94,6 +111,12 @@ class Settings:
     database_mode: str
     """``configured``, or ``run`` and ``worker``: a database of pytest-sqla's own."""
     keep_database: bool
+    alembic_config: str = DEFAULT_ALEMBIC_CONFIG
+    """``sqla_schema = alembic``: the config file, relative to the rootdir."""
+    alembic_targets: tuple[str, ...] = (DEFAULT_ALEMBIC_TARGET,)
+    """The revisions to upgrade to, one ``command.upgrade`` each."""
+    alembic_url: str | None = None
+    """``sync`` or ``async``, the URL env.py gets; None picks ``sync`` when sqla_url is set."""
 
     @property
     def configured(self) -> ConfiguredURL | None:
@@ -130,6 +153,8 @@ class Owned:
     worker: str | None
     lock_timeout: float
     keep: bool
+    migrates: bool = False
+    """``sqla_schema = alembic``: the worker that creates it migrates it under the lock."""
 
     @property
     def url(self) -> URL:
@@ -246,8 +271,26 @@ def add_options(parser: pytest.Parser) -> None:
     )
     parser.addini(
         "sqla_schema",
-        "'create' (default): create and drop the metadata's tables. 'none': no DDL at all.",
+        "'create' (default): create and drop the metadata's tables. 'none': no DDL at all. "
+        "'alembic': run your Alembic migrations in a database pytest-sqla creates.",
         default="create",
+    )
+    parser.addini(
+        "sqla_alembic_config",
+        "sqla_schema = alembic: the Alembic config file, relative to the rootdir, or a "
+        "pyproject.toml. Default alembic.ini.",
+        default=DEFAULT_ALEMBIC_CONFIG,
+    )
+    parser.addini(
+        "sqla_alembic_target",
+        "sqla_schema = alembic: the revisions to upgrade to, separated by spaces. Default heads.",
+        default=DEFAULT_ALEMBIC_TARGET,
+    )
+    parser.addini(
+        "sqla_alembic_url",
+        "sqla_schema = alembic: 'sync' hands env.py sqla_url's driver, 'async' sqla_async_url's. "
+        "Default sync when sqla_url is set.",
+        default="",
     )
     parser.addini(
         "sqla_lock_timeout",
@@ -268,7 +311,7 @@ def read_settings(config: pytest.Config) -> Settings:
     schema_mode = str(config.getini("sqla_schema"))
     if schema_mode not in SCHEMA_MODES:
         raise pytest.UsageError(
-            f"pytest-sqla: sqla_schema must be 'create' or 'none', got {schema_mode!r}."
+            f"pytest-sqla: sqla_schema must be 'create', 'none' or 'alembic', got {schema_mode!r}."
         )
     lock_timeout = _lock_timeout(config)
     metadata_path = str(config.getini("sqla_metadata")) or None
@@ -299,9 +342,14 @@ def read_settings(config: pytest.Config) -> Settings:
         memory_name=f"pytest-sqla-{uuid.uuid4().hex}",
         database_mode=_database_mode(config),
         keep_database=bool(config.getoption("--sqla-keep-database")),
+        alembic_config=str(config.getini("sqla_alembic_config")) or DEFAULT_ALEMBIC_CONFIG,
+        alembic_targets=tuple(str(config.getini("sqla_alembic_target")).split())
+        or (DEFAULT_ALEMBIC_TARGET,),
+        alembic_url=_alembic_url(config),
     )
     _check_database(config, settings)
     _check_memory(settings)
+    _check_alembic(settings)
     return settings
 
 
@@ -358,6 +406,70 @@ def _private_memory(url: URL, settings: Settings) -> str | None:
         "session, or a URI that SQLite shares between connections: file:/NAME?vfs=memdb "
         "without mode=memory, or one with cache=shared."
     )
+
+
+def _alembic_url(config: pytest.Config) -> str | None:
+    value = str(config.getini("sqla_alembic_url")) or None
+    if value is not None and value not in ALEMBIC_URLS:
+        raise pytest.UsageError(
+            f"pytest-sqla: sqla_alembic_url must be 'sync' or 'async', got {value!r}."
+        )
+    return value
+
+
+def _check_alembic(settings: Settings) -> None:
+    """sqla_schema = alembic needs a database it may migrate, and Alembic installed.
+
+    The database first: installing Alembic would not help with the wrong one.
+    ``find_spec`` locates the package without importing it, so a run that
+    never builds the schema still imports no Alembic.
+    """
+    if settings.schema_mode != "alembic":
+        return
+    configured = settings.configured
+    refusal = None if configured is None else alembic_refusal(configured.url, settings)
+    if refusal is not None:
+        raise pytest.UsageError(refusal)
+    if importlib.util.find_spec("alembic") is None:
+        raise pytest.UsageError(
+            "pytest-sqla: sqla_schema = alembic runs your Alembic migrations, and Alembic is not "
+            "installed. Install pytest-sqla[alembic]."
+        )
+
+
+def alembic_refusal(url: URL, settings: Settings) -> str | None:
+    """Why ``sqla_schema = alembic`` may not migrate ``url``'s database, or None.
+
+    It migrates only a database pytest-sqla made and discards: one that
+    ``sqla_database = run`` or ``worker`` created, or an in-memory SQLite
+    database. A file the user named is never deleted, so it could not be
+    handed back empty. An in-memory URI that gives each connection a database
+    of its own is refused for every schema mode by ``_private_memory``.
+    """
+    backend = url.get_backend_name()
+    if backend == "sqlite":
+        if _sqlite.is_plain_memory(url) or _sqlite.is_memory_uri(url):
+            return None
+        return (
+            "pytest-sqla: sqla_schema = alembic migrates an in-memory SQLite database, such as "
+            f"sqla_url = sqlite://, and {render(url)} is a file. pytest-sqla never deletes a file "
+            "you named, so it could not give it back empty. Use an in-memory URL, or migrate the "
+            "file before the run and set sqla_schema = none."
+        )
+    if backend not in _NAME_LIMITS:
+        return (
+            "pytest-sqla: sqla_schema = alembic runs on PostgreSQL, MySQL and MariaDB, with "
+            f"sqla_database = run or worker, and on in-memory SQLite; {render(url)} is {backend}. "
+            "Migrate the database before the run and set sqla_schema = none."
+        )
+    if settings.database_mode == "configured":
+        return (
+            "pytest-sqla: sqla_schema = alembic migrates a database pytest-sqla creates and "
+            f"drops, and sqla_database = configured uses {render(url)} as it is. Set "
+            "sqla_database = run or worker, or migrate the database before the run and set "
+            "sqla_schema = none."
+        )
+    return None
 
 
 def _lock_timeout(config: pytest.Config) -> float:
@@ -491,6 +603,7 @@ def resolve_targets(sync_value: object, async_value: object, settings: Settings)
         pytest.fail(mismatch, pytrace=False)
     async_setting = "sqla_url" if asynchronous == sync else "sqla_async_url"
     owned = _owned(sync or asynchronous, settings)
+    _refuse_alembic(sync or asynchronous, settings)
     memory = any(_sqlite.is_plain_memory(url) for url in (sync, asynchronous) if url is not None)
     sync = _effective(sync, settings, owned)
     asynchronous = _effective(asynchronous, settings, owned)
@@ -530,7 +643,17 @@ def _owned(url: URL | None, settings: Settings) -> Owned | None:
         worker=settings.worker,
         lock_timeout=settings.lock_timeout,
         keep=settings.keep_database,
+        migrates=settings.schema_mode == "alembic",
     )
+
+
+def _refuse_alembic(url: URL | None, settings: Settings) -> None:
+    """The configure-time check, on the fixture's URL: an override such as a container's."""
+    if url is None or settings.schema_mode != "alembic":
+        return
+    refusal = alembic_refusal(url, settings)
+    if refusal is not None:
+        pytest.fail(refusal, pytrace=False)
 
 
 def _fixture_url(value: object, setting: str) -> URL | None:

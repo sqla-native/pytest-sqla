@@ -32,8 +32,12 @@ for _module in (
     "pymysql",
     "aiomysql",
     "asyncmy",
+    # alembic registers compilation rules for SQLAlchemy constructs as it imports.
+    "alembic.command",
+    "alembic.ddl",
+    "alembic.runtime.environment",
 ):
-    with contextlib.suppress(ImportError):  # the sync-only CI job lacks the async ones
+    with contextlib.suppress(ImportError):  # the sync-only CI job lacks the async ones, alembic
         importlib.import_module(_module)
 
 pytest_plugins = ["pytester"]

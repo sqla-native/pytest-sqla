@@ -4,6 +4,9 @@ import pytest
 from fastapi_app.app import Base as ApiBase
 from sync_app.services import Base as ServicesBase
 
+# A session of its own, with its own pytest.ini: its schema comes from Alembic.
+collect_ignore = ["alembic_app"]
+
 
 @pytest.fixture(scope="session")
 def sqla_metadata() -> list[type]:

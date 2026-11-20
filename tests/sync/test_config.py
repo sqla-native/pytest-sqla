@@ -216,12 +216,12 @@ def usage_error(project: Project, *args: str) -> pytest.RunResult:
     return result
 
 
-@pytest.mark.parametrize("value", ["sometimes", "Create"])
-def test_sqla_schema_must_be_create_or_none(project: Project, value: str) -> None:
+@pytest.mark.parametrize("value", ["sometimes", "Create", "alembic upgrade"])
+def test_sqla_schema_must_be_create_none_or_alembic(project: Project, value: str) -> None:
     project.ini(sqla_schema=value)
     result = usage_error(project)
     result.stderr.fnmatch_lines(
-        [f"*pytest-sqla: sqla_schema must be 'create' or 'none', got {value!r}."]
+        [f"*pytest-sqla: sqla_schema must be 'create', 'none' or 'alembic', got {value!r}."]
     )
 
 

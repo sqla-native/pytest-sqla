@@ -47,6 +47,12 @@ dependencies = ["sqlalchemy>=2.0", "pytest>=8.2"]
 # than its own loop scope's fixtures. SQLAlchemy 2.1 no longer installs greenlet,
 # which its asyncio extension cannot import without.
 asyncio = ["pytest-asyncio>=1.2", "sqlalchemy[asyncio]>=2.0"]
+# sqla_schema = alembic only, imported inside function bodies (constitution
+# section 5). 1.16.0 is the first with Config(toml_file=) and the path helpers
+# the mode resolves paths with; before 1.13.2, alembic warned on every DDL
+# statement under SQLAlchemy 2.1, which filterwarnings = error turns into a
+# failed run.
+alembic = ["alembic>=1.16"]
 
 [project.urls]
 Homepage = "https://github.com/sqla-native/pytest-sqla"
@@ -79,8 +85,9 @@ dev = [
     "cryptography>=42",
     "build>=1.0",
     "twine>=5.0",
-    # The README's Alembic recipe runs as a test.
-    "alembic>=1.13",
+    # sqla_schema = alembic and the README's Alembic recipe, on the latest
+    # alembic; the floor job proves the extra's floor, 1.16.0.
+    "alembic>=1.20",
 ]
 
 [tool.hatch.build.targets.wheel]

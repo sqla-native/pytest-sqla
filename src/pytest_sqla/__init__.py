@@ -34,8 +34,11 @@ class SchemaConflictError(PytestSqlaError):
 
     Raised by ``sqla_schema``: the database holds tables pytest-sqla did not
     create, or another run's schema, or a lock could not be taken in time.
-    The fixture is session-scoped, so a conflict at creation fails every
-    database test, and one at the drop fails the last teardown of the run.
+    With ``sqla_schema = alembic``, also when the migrations reach another
+    database, leave a target unreached, find no revisions, or meet an env.py
+    whose engine does not suit the URL's driver. The fixture is
+    session-scoped, so a conflict at creation fails every database test, and
+    one at the drop fails the last teardown of the run.
     """
 
 

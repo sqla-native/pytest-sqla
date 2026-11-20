@@ -14,6 +14,7 @@ setup error on the test that hit it, worded for the fixture it asked for.
 from __future__ import annotations
 
 import contextlib
+import functools
 import importlib
 from collections.abc import AsyncIterator, Callable, Iterator
 from dataclasses import dataclass
@@ -26,15 +27,16 @@ from sqlalchemy.engine import URL, Connection, Engine
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import Session, sessionmaker
 
-from . import SchemaConflictError, _asyncio, _config, _database, _schema, _sqlite
+from . import SchemaConflictError, _alembic, _asyncio, _config, _database, _schema, _sqlite
 from ._asyncio import AsyncState
-from ._config import SETTINGS, Settings, Targets, render
+from ._config import ASYNC_DRIVERS, SETTINGS, SYNC_DRIVERS, Settings, Targets, render
 from ._engines import async_engine, sync_engine
 from ._isolation import Isolation, check_session_options, end_isolation, open_isolation
 
 if TYPE_CHECKING:
     import sqlite3
 
+    from alembic.config import Config
     from sqlalchemy.ext.asyncio import (
         AsyncConnection,
         AsyncEngine,
@@ -46,18 +48,6 @@ SYNC_FIXTURES = frozenset({"sqla_connection", "sqla_sessionmaker", "sqla_session
 ASYNC_FIXTURES = frozenset(
     {"sqla_async_connection", "sqla_async_sessionmaker", "sqla_async_session"}
 )
-_SYNC_DRIVERS = {
-    "postgresql": "postgresql+psycopg",
-    "mysql": "mysql+pymysql",
-    "mariadb": "mariadb+pymysql",
-    "sqlite": "sqlite",
-}
-_ASYNC_DRIVERS = {
-    "postgresql": "postgresql+asyncpg",
-    "mysql": "mysql+aiomysql",
-    "mariadb": "mariadb+aiomysql",
-    "sqlite": "sqlite+aiosqlite",
-}
 _ANNOUNCED = pytest.StashKey[list[str]]()
 """Lines for the terminal summary, such as the databases --sqla-keep-database kept."""
 _WORKER_OUTPUT = "pytest_sqla"
@@ -234,15 +224,34 @@ def sqla_session_options() -> dict[str, Any]:
 
 
 @pytest.fixture(scope="session")
+def sqla_alembic_config(request: pytest.FixtureRequest) -> Config:
+    """The Alembic configuration ``sqla_schema = alembic`` runs: an ``alembic.config.Config``.
+
+    Read from the ``sqla_alembic_config`` ini key, a path relative to the
+    rootdir, ``alembic.ini`` by default. A ``.toml`` path is a pyproject.toml
+    whose ``[tool.alembic]`` table holds the configuration; next to an ini
+    file, the pyproject.toml beside it is read too, for the keys the ini
+    lacks. Override it to build the Config in Python. Whatever it returns,
+    pytest-sqla sets ``sqlalchemy.url`` and ``config.attributes["connection"]``
+    on it, for the database it migrates, and resolves the relative paths in it
+    against its file's directory, or the rootdir when it has none. Requested
+    only with ``sqla_schema = alembic``, so nothing imports Alembic otherwise.
+    """
+    return _alembic.default_config(request.config.rootpath / _settings(request).alembic_config)
+
+
+@pytest.fixture(scope="session")
 def sqla_schema(request: pytest.FixtureRequest) -> Iterator[None]:
     """Creates the metadata's tables before the first database test; drops them at the end.
 
     With ``sqla_schema = create`` (the default) the tables are created once per
     run under a database-level lock, joined by sibling xdist workers, and
     dropped by the last one out. Tables pytest-sqla did not create are refused,
-    never dropped. With ``sqla_schema = none`` it does nothing. Override it to
-    build the schema yourself, for example with Alembic on
-    ``sqla_database_url``.
+    never dropped. With ``sqla_schema = none`` it does nothing. With
+    ``sqla_schema = alembic`` your Alembic migrations build the schema, in a
+    database ``sqla_database = run`` or ``worker`` creates, when it creates
+    it, or in an in-memory SQLite database, once per session. Override it to
+    build the schema yourself on ``sqla_database_url``.
 
     A database pytest-sqla made up - an in-memory or per-worker SQLite one, or
     one ``sqla_database = run`` or ``worker`` created - is discarded at the end
@@ -260,6 +269,10 @@ def sqla_schema(request: pytest.FixtureRequest) -> Iterator[None]:
     url = targets.ddl
     if url is None:
         _no_database("sqla_schema")
+    if settings.schema_mode == "alembic":
+        _migrate_in_memory(request, targets)
+        yield
+        return
     plan = _schema_plan(request, settings, url)
     _reported(_schema.prepare, plan)
     yield
@@ -305,6 +318,29 @@ def _schema_plan(request: pytest.FixtureRequest, settings: Settings, url: URL) -
     )
 
 
+def _migrate_in_memory(request: pytest.FixtureRequest, targets: Targets) -> None:
+    """SQLite in memory: once per session, after the keeper opens and before any test connects.
+
+    A database ``sqla_database`` created was migrated as it was created, by
+    the worker that created it (``_sqla_database``).
+    """
+    __tracebackhide__ = True
+    if targets.owned is None:
+        request.getfixturevalue("_sqla_sqlite_keeper")
+        _reported(_alembic.migrate, _migration(request, targets))
+
+
+def _migration(request: pytest.FixtureRequest, targets: Targets) -> _alembic.Migration:
+    """What sqla_schema = alembic runs, decided before anything connects."""
+    return _alembic.plan(
+        request.getfixturevalue("sqla_alembic_config"),
+        targets,
+        _settings(request),
+        request.getfixturevalue("sqla_engine_options"),
+        request.config.rootpath,
+    )
+
+
 # ----------------------------------------------------------- internal fixtures
 
 
@@ -322,14 +358,20 @@ def _sqla_database(
 
     Every fixture that connects depends on this one, so pytest tears all of
     them down first: pytest-sqla's own engines are disposed before the last
-    worker out drops the database.
+    worker out drops the database. With ``sqla_schema = alembic`` the worker
+    that creates the database migrates it right then, under the lock.
     """
     __tracebackhide__ = True
     owned = _sqla_urls.owned
     if owned is None:
         yield _sqla_urls
         return
-    _, left_behind = _reported(_database.join, owned, sqla_engine_options)
+    build = (
+        functools.partial(_alembic.migrate, _migration(request, _sqla_urls))
+        if owned.migrates
+        else None
+    )
+    _, left_behind = _reported(_database.join, owned, sqla_engine_options, build)
     for line in left_behind:
         _announce(request.config, line)
     yield _sqla_urls
@@ -575,7 +617,7 @@ def _sync_state(request: pytest.FixtureRequest, fixture: str) -> _SyncState:
     assert targets.sync is not None, "sqla_url is set"
     if targets.sync.get_dialect().is_async:
         backend = targets.sync.get_backend_name()
-        example = _SYNC_DRIVERS.get(backend, f"{backend}+<driver>")
+        example = SYNC_DRIVERS.get(backend, f"{backend}+<driver>")
         pytest.fail(
             f"pytest-sqla: {fixture} is synchronous, but sqla_url uses the async driver "
             f"{targets.sync.get_driver_name()}. Use the sqla_async_* fixtures, or set sqla_url "
@@ -599,7 +641,7 @@ def _async_state(request: pytest.FixtureRequest, fixture: str) -> AsyncState:
     assert url is not None, "sqla_async_url is set"
     if not url.get_dialect().get_async_dialect_cls(url).is_async:
         backend = url.get_backend_name()
-        example = _ASYNC_DRIVERS.get(backend, f"{backend}+<async driver>")
+        example = ASYNC_DRIVERS.get(backend, f"{backend}+<async driver>")
         pytest.fail(
             f"pytest-sqla: {fixture} needs an async driver, but {targets.async_setting} uses "
             f"{url.get_driver_name()}. Set sqla_async_url to the same database with an async "

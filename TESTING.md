@@ -28,7 +28,7 @@ Plus the static gates on every run: `ruff check`, `ruff format --check`,
 
 | You changed | Run |
 | --- | --- |
-| `_isolation.py`, `_schema.py`, `_database.py`, `_asyncio.py`, `_engines.py` | `verify.sh --all`, then a scoped mutation run |
+| `_isolation.py`, `_schema.py`, `_database.py`, `_alembic.py`, `_asyncio.py`, `_engines.py` | `verify.sh --all`, then a scoped mutation run |
 | `_config.py`, `_sqlite.py`, `plugin.py` | `verify.sh`; `--all` if a database path changed |
 | An error message | `verify.sh`: the tests pin the wording |
 | Anything with a performance claim | `python scripts/benchmark.py` before and after |
@@ -53,12 +53,20 @@ inertness check use a subprocess.
   usage error, sync isolation and breaches, the schema and its locks, SQLite,
   the engine and session options, the public surface, what a sync-only
   install reports, and the README's Alembic recipe, run as its code block is
-  written. The sync-only CI job runs exactly this directory with no
-  pytest-asyncio, anyio, greenlet, aiosqlite or alembic installed.
+  written. `test_alembic_mode.py` runs `sqla_schema = alembic` on in-memory
+  SQLite, on projects `alembic init` wrote: the templates and the cookbook's
+  env.py, the guard, logging, paths, targets and the check afterwards, each
+  seen failing with its protection taken out. `test_alembic_settings.py`
+  holds the mode's usage errors. The sync-only CI job runs exactly this
+  directory with no pytest-asyncio, anyio, greenlet, aiosqlite or alembic
+  installed, so there the mode's usage error names the extra for real.
 - `tests/test_isolation_async.py`, `test_loops.py`, `test_async_sqlite.py`:
   the async family under pytest-asyncio strict and auto mode, every loop
   scope, anyio and both plugin orders, the loop guard, tasks a test leaves
-  running, NullPool and per-loop pools.
+  running, NullPool and per-loop pools. `test_alembic_async.py`: Alembic's
+  async template, the URL `sqla_alembic_url` picks, and the migration's own
+  thread, inside a running loop too; `test_alembic_drivers.py`: where each
+  server driver takes the database the guard checks.
 - `tests/test_xdist.py`: per-worker SQLite files, per-process memory databases,
   and, in-process so that coverage sees the controller's hooks, the run id
   the controller hands its workers and the lines it collects from them.
@@ -99,7 +107,13 @@ escaping, and pytest-xdist workers sharing one database. And
 and `worker` create: once per run, joined by a late worker, one per worker,
 two runs at once, a worker killed with SIGKILL, leaked connections at the
 drop, missing privileges, names at the length limit, marks that are not this
-run's, and the control, a database every worker drops and creates.
+run's, and the control, a database every worker drops and creates. And
+`tests/integration/test_alembic.py`, `sqla_schema = alembic` on both
+servers through every driver: a run database migrated once while the other
+workers wait, one per worker, CREATE INDEX CONCURRENTLY while a worker waits
+on the lock, a failing migration dropping its database in every worker that
+tries it, the guard refusing the configured database, and a password with
+%XX on SQLAlchemy's floor.
 `scripts/mysql-init.sql`, which compose.yaml mounts and CI runs, lets the
 MySQL user create the databases named after its own, and adds one that may
 not.
@@ -132,7 +146,8 @@ pytest examples -q
 
 A FastAPI app tested through `httpx.AsyncClient` with a dependency override,
 under pytest-asyncio and under anyio, and a sync service layer that commits
-through its own sessions. Each example's last test asserts the earlier tests'
+through its own sessions. `examples/alembic_app` gets its schema from two
+Alembic migrations, in a session of its own: `pytest examples/alembic_app`. Each example's last test asserts the earlier tests'
 commits were rolled back, so the examples dogfood the plugin's promise. CI
 runs them on SQLite, then on PostgreSQL and MySQL by setting
 `PYTEST_SQLA_URL` and `PYTEST_SQLA_ASYNC_URL`.

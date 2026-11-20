@@ -22,7 +22,7 @@ that a 30-line conftest gets wrong.
 The plugin most projects find first, pytest-async-sqlalchemy, last shipped in
 October 2021 and fails before its first test on pytest-asyncio 1.x, with
 `fixture 'event_loop' not found`. The others are sync-only, or leave the
-SQLite workaround to you, or monkeypatch SQLAlchemy. pytest-sqla gets seven hard
+SQLite workaround to you, or monkeypatch SQLAlchemy. pytest-sqla gets eight hard
 parts right on its own, each one measured:
 
 1. **Commit and rollback stay inside the test.** The default join mode turns
@@ -54,19 +54,26 @@ parts right on its own, each one measured:
    its xdist workers and dropped by the last one out, or one per worker with
    `worker`. The usual fixture that drops and recreates one test database
    breaks under xdist, because every worker drops the one the others use.
+8. **Your Alembic migrations, if you have them.** With `sqla_schema =
+   alembic` they build the schema instead of `create_all`, once per database,
+   with your env.py as it is, and pytest-sqla checks afterwards that they
+   reached your heads. A connection the migrations open to any other
+   database, such as the application's own `DATABASE_URL`, is refused.
 
 ## Install
 
 ```bash
 pip install pytest-sqla                # sync fixtures
 pip install "pytest-sqla[asyncio]"     # adds pytest-asyncio and greenlet
+pip install "pytest-sqla[alembic]"     # adds Alembic, for sqla_schema = alembic
 ```
 
 The two runtime dependencies are `sqlalchemy>=2.0` and `pytest>=8.2`. The
 `asyncio` extra adds `pytest-asyncio>=1.2` and `sqlalchemy[asyncio]`: SQLAlchemy
 2.1 no longer installs greenlet, which its asyncio extension cannot import
 without. anyio users already have anyio through Starlette, so they need
-`pip install pytest-sqla "sqlalchemy[asyncio]"`.
+`pip install pytest-sqla "sqlalchemy[asyncio]"`. The `alembic` extra adds
+`alembic>=1.16`, which only `sqla_schema = alembic` imports.
 
 ## Quick start
 
@@ -196,7 +203,8 @@ and under anyio: see
 | `sqla_metadata` | session | config | The metadata to create, from the `sqla_metadata` ini key or an override. |
 | `sqla_engine_options` | session | config | Keyword arguments for every engine. Default `{}`. |
 | `sqla_session_options` | session | config | Keyword arguments for the sessionmakers. Default `{}`. |
-| `sqla_schema` | session | config | Creates the tables once, drops them at the end. Override it for Alembic. |
+| `sqla_schema` | session | config | Creates the tables once, drops them at the end; with `sqla_schema = alembic`, your migrations build them. |
+| `sqla_alembic_config` | session | config | The `alembic.config.Config` that `sqla_schema = alembic` runs, from the `sqla_alembic_config` ini key or an override. |
 | `sqla_connection` | function | sync | A `Connection` inside the test transaction. |
 | `sqla_sessionmaker` | function | sync | A `sessionmaker` bound to it, for dependency overrides. |
 | `sqla_session` | function | sync | A `Session` from it, closed at teardown. |
@@ -217,7 +225,10 @@ see each other's writes, and asking for both is an error.
 | Database URL | `--sqla-url` | `PYTEST_SQLA_URL` | `sqla_url` | none |
 | Async URL | `--sqla-async-url` | `PYTEST_SQLA_ASYNC_URL` | `sqla_async_url` | the database URL |
 | Metadata | | | `sqla_metadata = "app.models:Base"` | none |
-| Schema mode | | | `sqla_schema = create` or `none` | `create` |
+| Schema mode | | | `sqla_schema = create`, `none` or `alembic` | `create` |
+| Alembic config file, from the rootdir | | | `sqla_alembic_config` | `alembic.ini` |
+| Alembic revisions to upgrade to | | | `sqla_alembic_target` | `heads` |
+| The URL env.py gets, `sync` or `async` | | | `sqla_alembic_url` | `sync` when `sqla_url` is set |
 | A database of its own | | | `sqla_database = configured`, `run` or `worker` | `configured` |
 | Lock, DDL and teardown timeout, seconds | | | `sqla_lock_timeout` | `30` |
 | Replace a crashed run's schema | `--sqla-recreate-schema` | | | off |
@@ -237,12 +248,13 @@ replaces the computed value, as with any pytest fixture.
 - **Only its own variables.** pytest-sqla never reads your application's
   `DATABASE_URL`, so it cannot pick up a database that is not for tests.
 - **Checked before the run.** The URLs, the schema and database modes, the
-  timeout, the shape of `sqla_metadata` and the names `sqla_database` derives
-  are checked at startup; a bad one stops the run with a usage error that
+  timeout, the shape of `sqla_metadata`, the names `sqla_database` derives
+  and whether `sqla_schema = alembic` may migrate the database are checked at
+  startup; a bad one stops the run with a usage error that
   never repeats the URL's password.
 - **Inert unless asked.** A run whose tests never request an `sqla_*` fixture
   imports no application code, opens no connection, and never imports
-  `sqlalchemy.ext.asyncio`.
+  `sqlalchemy.ext.asyncio` or Alembic.
 - **The report header says which database the run is configured for:**
   `sqla: url=postgresql+psycopg://app:***@localhost/app_test (from PYTEST_SQLA_URL), schema=create, database=configured`,
   and with `sqla_database = run`, `database=run (app_test_1a2b3c4d)`. It
@@ -317,6 +329,10 @@ its tables dropped.
 **`sqla_schema = none`** runs no DDL at all, for a database migrated before the
 run, for example by `alembic upgrade head` in a CI step.
 
+**`sqla_schema = alembic`** runs your Alembic migrations instead of
+`create_all`, in a database pytest-sqla creates and drops, or an in-memory
+SQLite one: see [Alembic](#alembic).
+
 **Overriding the `sqla_schema` fixture** replaces all of it. Set
 `sqla_schema = none` as well, so the URL is used exactly as configured, and use
 a file or server database: an in-memory SQLite database exists only inside
@@ -347,7 +363,8 @@ a password that needs escaping, and into a database of its own on PostgreSQL,
 which is dropped at the end, so there the downgrade only costs time. Under
 pytest-xdist such an override runs once per worker, so it has to serialise
 itself, unless `sqla_database = worker` gives each worker a database to
-migrate on its own.
+migrate on its own. `sqla_schema = alembic` does all of that for you, and
+checks the result.
 
 ## A database of its own
 
@@ -416,6 +433,107 @@ one test database, breaks under pytest-xdist: every worker runs it and drops
 the database the others are using. The suite runs that fixture as a control,
 with four workers whose tests overlap: it fails, and the same tests pass with
 `sqla_database = run`.
+
+## Alembic
+
+**`sqla_schema = alembic`** builds the schema with your Alembic migrations,
+the way production gets it, instead of `create_all`. Install the `alembic`
+extra. The migrations run only in a database pytest-sqla made and discards,
+so one that fails, or stops half way, leaves nothing that anything uses:
+
+- **PostgreSQL, MySQL and MariaDB, with `sqla_database = run` or `worker`.**
+  The worker that creates the database migrates it right after `CREATE
+  DATABASE`, under the database lock. The others wait on the lock, at most
+  `sqla_lock_timeout`, and join a migrated database. A migration that fails
+  drops the database again, so a worker that was waiting creates it once
+  more, migrates it, and reports the same error itself. One that will not
+  drop, such as on MySQL behind a transaction the migration left open, is
+  marked as a failed migration's instead, and every worker refuses it, the
+  error saying so. With `run`, raise `sqla_lock_timeout` above the time your
+  migrations take, or use `worker`, where each worker migrates a database of
+  its own.
+- **SQLite in memory**, such as `sqla_url = sqlite://`, once per session. A
+  file you named is refused: pytest-sqla never deletes it, so it could not
+  give it back empty. So is `sqla_database = configured` on a server, for the
+  same reason.
+
+```toml
+[tool.pytest.ini_options]
+sqla_url = "sqlite://"
+sqla_schema = "alembic"
+sqla_database = "run"   # when PYTEST_SQLA_URL points at PostgreSQL or MySQL in CI
+```
+
+`sqla_metadata` is not needed, and ignored if set, so one configuration can
+serve both modes: `-o sqla_schema=alembic` in a CI job runs the migrations,
+and `create_all` stays the quick path on a laptop.
+
+- **Your env.py as it is.** It gets what env.py files use:
+  `config.attributes["connection"]`, a connection to the database through
+  `sqla_url`'s driver when that driver is synchronous, and the
+  `sqlalchemy.url` option, the same database. Alembic's templates build an
+  engine from the URL; the cookbook's env.py uses the connection. The
+  connection is handed over idle, with no transaction begun, so Alembic runs
+  its transactions as on its command line, and `autocommit_block()` (CREATE
+  INDEX CONCURRENTLY) works. The migrations run on a thread with no event
+  loop, so the async template's `asyncio.run()` works too.
+- **`sqla_alembic_url`** picks the URL env.py gets: `sync`, through
+  `sqla_url`'s driver, the default when `sqla_url` is set, or `async`,
+  through `sqla_async_url`'s. A synchronous env.py needs a synchronous driver
+  and the async template an async one; the wrong pair fails with a message
+  that says which value to set. With only an async driver configured, env.py
+  gets the URL alone.
+- **Nothing else gets migrated.** While the migrations and the check run, a
+  connection they open to any other database is refused before it is used,
+  such as an env.py that prefers the application's own `DATABASE_URL`, and
+  so is one SQLAlchemy did not make from its connect arguments, such as an
+  engine with `creator=`, or one whose arguments a `do_connect` hook changed
+  after pytest-sqla read them. Connections other threads open meanwhile pass.
+  What it cannot see is a `do_connect` hook that runs after its own and
+  returns a connection it made itself.
+- **The configuration** is `sqla_alembic_config`, relative to the rootdir,
+  `alembic.ini` by default; the `pyproject.toml` next to it is read too, for
+  what its `[tool.alembic]` table sets, and a `.toml` path is a
+  pyproject.toml alone. Relative `script_location`, `prepend_sys_path` and
+  `version_locations` are read from that file's directory, as `%(here)s`
+  would be, from whatever directory pytest runs; package resources
+  (`package:dir`) and absolute paths stay as they are. To build the `Config`
+  in Python, override the `sqla_alembic_config` fixture: pytest-sqla sets the
+  URL and the connection on whatever it returns, and reads relative paths
+  from the rootdir when it has no file.
+- **Targets.** `sqla_alembic_target`, `heads` by default, is one or more
+  revisions separated by spaces, upgraded to one after another: `pre@head
+  post@head` for two branches. Afterwards pytest-sqla reads the heads back
+  through env.py, as `alembic current` does, a custom `version_table`
+  included, and fails when a target was not reached. A script directory
+  without revisions is refused, since a wrong `version_locations` would
+  otherwise migrate nothing at all, and so is a relative target such as `+1`,
+  which that check cannot follow.
+- **Logging and `sys.path` as they were.** env.py's `fileConfig()` closes
+  pytest's log handlers and disables every logger its file does not name.
+  pytest-sqla puts the configuration back afterwards and reopens the log
+  files, so caplog and `--log-file` go on working, and takes the
+  `prepend_sys_path` entries out of `sys.path` again.
+- **Errors** say what to do. A migration that raises reaches you as it
+  raised, with its own traceback. A legacy `alembic.ini` without
+  `path_separator` gets Alembic's own DeprecationWarning, which says what to
+  add, as on its command line; under `filterwarnings = error` it fails the
+  run. SQLAlchemy before 2.0.24 changes `%XX` in a password when it writes a
+  URL out, so there such a URL is refused rather than handed to env.py with
+  another password.
+- **The rest stays the same.** `sqla_database_url` is the migrated database.
+  `--sqla-keep-database` keeps it, migrated; a database whose migration
+  failed is dropped all the same, because a waiting worker would otherwise
+  join it half migrated. `--sqla-recreate-schema` changes nothing, the
+  database being new every time. There is no downgrade: the database goes at
+  the end.
+
+On MySQL the database also holds pytest-sqla's mark, the
+`pytest_sqla_database` table, next to your migrations' tables and
+`alembic_version`: a test that compares your models with the migrated
+database, such as one built on `compare_metadata`, should leave it out with
+its `include_object`. [The example](https://github.com/sqla-native/pytest-sqla/tree/main/examples/alembic_app)
+runs in CI on SQLite, PostgreSQL and MySQL.
 
 ## Async details
 
@@ -516,7 +634,8 @@ loop than its own scope's fixtures.
   `file:/NAME?vfs=memdb`, and any of them with `cache=shared`, between
   connections; `file:NAME?mode=memory`, `file::memory:` and
   `file:NAME?vfs=memdb` give each connection its own empty database, as does
-  `mode=memory` next to `vfs=memdb`, so `sqla_schema = create` refuses them.
+  `mode=memory` next to `vfs=memdb`, so `sqla_schema = create` and `alembic`
+  refuse them.
   With `sqla_schema = none`, each test's connection has one of its own.
 - **Files.** A test's transaction on a SQLite file begins `IMMEDIATE`, in PEP
   249 mode too, so another process waits for it instead of failing with
@@ -615,7 +734,10 @@ setup. Three exception classes, all subclasses of `pytest_sqla.PytestSqlaError`:
   during creation; once, at the end of the run, for a drop blocked by a leaked
   transaction. With `sqla_database = run` or `worker`, also for a database it
   may not create, one with the run's name that is not its own, and its lock or
-  its drop timing out.
+  its drop timing out. With `sqla_schema = alembic`, also for a connection of
+  the migrations to another database, a target the database did not reach, a
+  script directory without revisions, a target Alembic cannot resolve, and an
+  env.py whose engine does not suit the URL's driver.
 
 A test's own failure always wins: a breach found at teardown is reported as a
 separate error and never replaces it. URLs in messages always hide the
@@ -691,21 +813,25 @@ database next to the container's.
 - CREATE SCHEMA for schema-qualified metadata is up to you.
 - On MySQL a database `sqla_database` created holds one table more than your
   schema, its mark, `pytest_sqla_database`, and pytest-sqla refuses a metadata
-  table of that name.
+  table of that name. With `sqla_schema = alembic` the mark is there while
+  your migrations run.
+- `sqla_schema = alembic` migrates one database, upward only: no downgrade,
+  no multi-database env.py, and no SQLite file.
 
 ## Compatibility
 
 - Python 3.11 to 3.15.
-- SQLAlchemy 2.0 and 2.1; pytest 8.2 or newer; pytest-asyncio 1.2 or newer.
+- SQLAlchemy 2.0 and 2.1; pytest 8.2 or newer; pytest-asyncio 1.2 or newer;
+  Alembic 1.16 or newer, for `sqla_schema = alembic`.
 - Tested in CI on PostgreSQL 17 with psycopg 3 (sync and async) and asyncpg,
   on MySQL 8.4 with pymysql, aiomysql and asyncmy, and on SQLite with pysqlite
   and aiosqlite. MariaDB uses the MySQL code path and is untested.
 
 ## Roadmap
 
-Alembic as a schema mode, under the same lock; data seeded once per module
-inside an outer savepoint; rebinding an application's own sessionmaker;
-factory_boy and polyfactory helpers; a docs site.
+Data seeded once per module inside an outer savepoint; rebinding an
+application's own sessionmaker; factory_boy and polyfactory helpers; a docs
+site.
 
 ## License
 

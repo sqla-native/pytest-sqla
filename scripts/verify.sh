@@ -2,9 +2,9 @@
 # The local verification ladder. See TESTING.md for what each layer proves.
 #
 #   ./scripts/verify.sh          lint, types, complexity, the hermetic suite,
-#                                the examples, packaging (the sdist and wheel
-#                                pass twine check --strict, as in CI and the
-#                                release). No Docker, ~1 minute.
+#                                the examples, the Alembic example, packaging
+#                                (the sdist and wheel pass twine check --strict,
+#                                as in CI and the release). No Docker, ~1 minute.
 #   ./scripts/verify.sh --all    adds the compose databases: the whole suite on
 #                                every backend under coverage (100% branch, which
 #                                only the real-database layer can reach), the
@@ -43,6 +43,7 @@ step "types"             "$BIN/mypy"
 step "complexity"        "$BIN/complexipy" src/pytest_sqla --max-complexity-allowed 15
 step "hermetic suite"    "$PYTHON" -m pytest -q -p no:cacheprovider
 step "examples"          "$PYTHON" -m pytest examples -q
+step "alembic example"   "$PYTHON" -m pytest examples/alembic_app -q
 step "distributions"     bash -c "
   out=\$(mktemp -d)
   '$PYTHON' -m build --outdir \"\$out\" . >/dev/null \
@@ -70,6 +71,12 @@ if [ "$WITH_DB" = "1" ]; then
     PYTEST_SQLA_URL=\$SQLA_TEST_MYSQL_PYMYSQL_URL \
     PYTEST_SQLA_ASYNC_URL=\$SQLA_TEST_MYSQL_AIOMYSQL_URL \
       '$PYTHON' scripts/check_no_skips.py examples -q"
+  step "alembic example on PostgreSQL and MySQL, no skips" bash -c "
+    source scripts/local-databases.env
+    PYTEST_SQLA_URL=\$SQLA_TEST_POSTGRES_PSYCOPG_URL \
+      '$PYTHON' scripts/check_no_skips.py examples/alembic_app -q \
+    && PYTEST_SQLA_URL=\$SQLA_TEST_MYSQL_PYMYSQL_URL \
+      '$PYTHON' scripts/check_no_skips.py examples/alembic_app -q"
   step "databases: down" docker compose down -v
 else
   printf '\n\033[33m  ~ real databases skipped (pass --all); the 100%% coverage gate needs them\033[0m\n'

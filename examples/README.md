@@ -10,7 +10,11 @@ pytest-sqla from PyPI:
 ```bash
 pip install -e . -r examples/requirements.txt
 pytest examples -q
+pytest examples/alembic_app -q
 ```
+
+The Alembic example runs as a session of its own: its schema comes from its
+migrations, with `sqla_schema = alembic`, and the others' from `create_all`.
 
 ## What is in here
 
@@ -24,6 +28,8 @@ pytest examples -q
 | `sync_app/test_services.py` | A transfer that commits, a refused one that rolls back only itself, and the next test seeing an empty table |
 | `conftest.py` | `sqla_metadata` as a fixture: two declarative bases, one test schema |
 | `pytest.ini` | `sqla_url = sqlite://` and `sqla_async_url = sqlite+aiosqlite://`, the committed defaults |
+| `alembic_app/` | `sqla_schema = alembic`: two migrations build the schema, with the env.py `alembic init` writes, in memory or, with `sqla_database = run`, in a database of the run's own |
+| `alembic_app/test_bookshelf.py` | A book added and committed, the next test seeing none of it, and the database at the head revision |
 
 ## Against a real server
 
@@ -31,6 +37,8 @@ pytest examples -q
 PYTEST_SQLA_URL=postgresql+psycopg://sqla:sqla@127.0.0.1:55434/sqla \
 PYTEST_SQLA_ASYNC_URL=postgresql+asyncpg://sqla:sqla@127.0.0.1:55434/sqla \
   pytest examples -q
+PYTEST_SQLA_URL=postgresql+psycopg://sqla:sqla@127.0.0.1:55434/sqla \
+  pytest examples/alembic_app -q
 ```
 
 Set both variables. The ini file sets `sqla_async_url` to SQLite, and

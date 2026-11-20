@@ -29,6 +29,38 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **`sqla_database_url` and `sqla_async_database_url`**, the URLs pytest-sqla
   connects to, for your own tools: `sqla_url` and `sqla_async_url` in
   configured mode on a server.
+- **`sqla_schema = alembic`: your Alembic migrations build the schema**, in
+  place of `create_all`, and only in a database pytest-sqla made and
+  discards. With `sqla_database = run` or `worker` on PostgreSQL, MySQL and
+  MariaDB, the worker that creates the database migrates it right then,
+  under the database lock, and the others join it migrated; on SQLite, an
+  in-memory database is migrated once per session. A migration that fails
+  drops its database again, so no worker joins one half migrated, and a
+  waiting worker that tries again reports the same error; a database that
+  will not drop is marked as a failed migration's, and every worker refuses
+  it. A configured database or a SQLite file is a usage error, and so is an
+  in-memory URI that gives each connection its own database, as in create
+  mode. `sqla_metadata` is ignored, so one configuration serves both modes.
+- **env.py runs as it is.** It gets an idle connection, as
+  `config.attributes["connection"]`, when a synchronous driver is
+  configured, and the database's URL as `sqlalchemy.url`; the migrations run
+  on a thread with no event loop, so Alembic's async template works, and
+  `autocommit_block()` runs CREATE INDEX CONCURRENTLY as in production.
+  While they run, a connection to any other database, or one SQLAlchemy did
+  not make from its connect arguments, is refused. Afterwards pytest-sqla
+  restores logging, which env.py's `fileConfig()` breaks for caplog and
+  `--log-file`, and `sys.path`, and reads the heads back through env.py to
+  check that every target was reached. Relative paths in the configuration
+  are read from its file's directory; a script directory without revisions,
+  a target Alembic cannot resolve, and an env.py whose engine does not suit
+  its URL's driver each get a message that says what to do.
+- **`sqla_alembic_config`** (the config file, relative to the rootdir,
+  `alembic.ini` by default, or a `pyproject.toml`), **`sqla_alembic_target`**
+  (`heads` by default) and **`sqla_alembic_url`** (`sync` or `async`, the
+  driver of the URL env.py gets), and the **`sqla_alembic_config` fixture**,
+  to build the `Config` in Python.
+- **The `alembic` extra**, `alembic>=1.16`, imported only in this mode:
+  without it, `sqla_schema = alembic` is a usage error that names the extra.
 
 ### Changed
 
