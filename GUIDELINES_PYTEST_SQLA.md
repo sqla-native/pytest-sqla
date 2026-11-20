@@ -226,9 +226,10 @@ isolation fails, at its own teardown, saying why.
   second.
 - **Check names before the run.** PostgreSQL truncates a name past 63 bytes
   without an error, so two derived names could become one, and a control in
-  the suite shows it; MySQL takes 64 characters. A name too long is a usage error, checked by the xdist
-  controller for its longest worker id, because a worker that fails its own
-  configure is replaced by xdist rather than reported (measured).
+  the suite shows it; MySQL takes 64 characters. A name too long is a usage
+  error, checked by the xdist controller for its longest worker id, because a
+  worker that fails its own configure is replaced by xdist rather than
+  reported (measured).
 - **One run id per run.** The xdist controller hands its own to every worker
   through `pytest_configure_node`, so every name derived from it agrees, the
   report header's included, which xdist prints before it makes its own.
