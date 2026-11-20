@@ -46,8 +46,8 @@ docker compose down -v
 ```
 
 Run them before any PR that touches `_isolation.py`, `_schema.py`,
-`_database.py`, `_asyncio.py` or `_engines.py`, and stop the containers when
-you are done.
+`_database.py`, `_alembic.py`, `_asyncio.py` or `_engines.py`, and stop the
+containers when you are done.
 
 ## Measure, don't reason from memory
 

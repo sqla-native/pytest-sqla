@@ -233,6 +233,22 @@ isolation fails, at its own teardown, saying why.
 - **One run id per run.** The xdist controller hands its own to every worker
   through `pytest_configure_node`, so every name derived from it agrees, the
   report header's included, which xdist prints before it makes its own.
+- **An Alembic build only in a database pytest-sqla owns, dropped when it
+  fails.** `sqla_schema = alembic` migrates a database `sqla_database = run`
+  or `worker` created, right after CREATE and under its lock, or an in-memory
+  SQLite database; never a configured database or a file the user named,
+  which it could not hand back empty. A migration that fails drops the
+  database again, after the same three checks, so nobody joins one half
+  migrated: a waiting worker creates it again and reports the error itself.
+  The connection goes to env.py idle, because a transaction of pytest-sqla's
+  own buys nothing in a database it drops, and measured, it broke
+  `autocommit_block()` with a bare AssertionError and, on SQLite, an env.py
+  engine of its own with "database is locked". While the upgrade and its
+  check run, class-level listeners refuse every connection the migration's
+  thread opens to another database (`do_connect` reads the driver's
+  arguments, `connect` refuses what `do_connect` never approved), and
+  afterwards the heads are read back through env.py: a wrong
+  `version_locations` otherwise migrates nothing, silently.
 
 ### 3. Breaches are errors in the test that caused them
 
@@ -255,7 +271,8 @@ isolation fails, at its own teardown, saying why.
 
 - Fixtures: `sqla_url`, `sqla_async_url`, `sqla_database_url`,
   `sqla_async_database_url`, `sqla_metadata`, `sqla_engine_options`,
-  `sqla_session_options`, `sqla_schema`, `sqla_connection`,
+  `sqla_session_options`, `sqla_schema`, `sqla_alembic_config`,
+  `sqla_connection`,
   `sqla_sessionmaker`, `sqla_session`, `sqla_async_connection`,
   `sqla_async_sessionmaker`, `sqla_async_session`. `sqla_database_url` and
   its async twin are what pytest-sqla connects to, read-only in spirit: the
@@ -264,7 +281,9 @@ isolation fails, at its own teardown, saying why.
 - Options: `--sqla-url`, `--sqla-async-url`, `--sqla-recreate-schema`,
   `--sqla-keep-database`; the `PYTEST_SQLA_URL` and `PYTEST_SQLA_ASYNC_URL`
   variables; the `sqla_url`, `sqla_async_url`, `sqla_metadata`,
-  `sqla_schema`, `sqla_database` and `sqla_lock_timeout` ini keys.
+  `sqla_schema` (`create`, `none` or `alembic`), `sqla_database`,
+  `sqla_lock_timeout`, `sqla_alembic_config`, `sqla_alembic_target` and
+  `sqla_alembic_url` ini keys.
   Precedence is command line, then environment, then ini.
 - The report header's `sqla:` line, and its `database=` value: the mode, and
   the name when the configuration determines it.
@@ -290,7 +309,7 @@ isolation fails, at its own teardown, saying why.
   by its source, never its value, because SQLAlchemy's parse error repeats it.
 - **Inert unless asked.** A run whose tests never request an `sqla_*` fixture
   imports no application code, opens no connection, never imports
-  `sqlalchemy.ext.asyncio`, and registers no per-test hooks.
+  `sqlalchemy.ext.asyncio` or alembic, and registers no per-test hooks.
 - **No default database, no silent fallback.** A missing URL fails the tests
   that need one (F1); an empty variable is a usage error. A green run on SQLite
   that was meant for PostgreSQL is the failure this rule exists for.
@@ -369,9 +388,9 @@ green CI without ceremony.
 - Every PR includes a supply-chain pass.
 - **Audit scope:** the release gate audits the *published* surface.
   `scripts/audit_production_surface.py` builds the wheel, installs it with its
-  `asyncio` extra into a clean virtualenv, and runs `pip-audit` on that
-  closure: SQLAlchemy, pytest and their dependencies, pytest-asyncio and
-  greenlet. Advisories confined to dev tooling are Dependabot's job and do not
+  `asyncio` and `alembic` extras into a clean virtualenv, and runs `pip-audit`
+  on that closure: SQLAlchemy, pytest and their dependencies, pytest-asyncio
+  and greenlet, and alembic, Mako and MarkupSafe. Advisories confined to dev tooling are Dependabot's job and do not
   block a release.
 - No secrets in code, tests, examples, logs, or docs. The compose and CI
   passwords are throwaway values for throwaway containers.
