@@ -35,7 +35,7 @@ from tests.alembic_kit import (
     MIGRATION,
     alembic_project,
 )
-from tests.helpers import Project
+from tests.helpers import Project, table_names
 from tests.integration.conftest import Database, sync_twin
 from tests.integration.test_databases import (
     LOG_STATEMENTS,
@@ -44,6 +44,7 @@ from tests.integration.test_databases import (
     drop_databases,
     owned_databases,
     run_database,
+    with_database,
 )
 from tests.integration.test_real_databases import run_twin
 from tests.integration.test_xdist_backends import WRITERS
@@ -363,6 +364,26 @@ def test_under_xdist_every_worker_reports_the_failing_migration_itself(
     assert len(creators) == 2, "each worker created the database itself"
     assert droppers == creators, "and dropped it again"
     assert owned_databases(sync_database) == []
+
+
+@pytest.mark.parametrize(
+    "revisions", [(MIGRATION,), (MIGRATION, FAILING)], ids=["migrated", "failed"]
+)
+def test_keep_database_keeps_a_migrated_database_and_still_drops_a_failed_one(
+    project: Project, sync_database: Database, run_id: str, revisions: tuple[str, ...]
+) -> None:
+    """A database whose migration failed goes whatever the option says: kept, a sibling
+    worker could join it half migrated."""
+    alembic_project(project, revisions=revisions)
+    result = run(project, sync_database, "--sqla-keep-database")
+    if len(revisions) == 2:
+        result.assert_outcomes(errors=3)
+        assert owned_databases(sync_database) == []
+        return
+    result.assert_outcomes(passed=3)
+    assert owned_databases(sync_database) == [run_database(sync_database)]
+    kept = with_database(sync_database, run_database(sync_database))
+    assert {"alembic_version", "note", "user_account"} <= set(table_names(sync_twin(kept.url)))
 
 
 REMARKED = '''

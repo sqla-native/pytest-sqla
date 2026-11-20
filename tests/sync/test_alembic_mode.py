@@ -56,6 +56,39 @@ def test_the_migrations_build_the_schema_and_every_test_is_rolled_back(project: 
     )
 
 
+BOTH_MODES = """
+from sqlalchemy import inspect
+from models import User, count
+
+
+def test_commits(sqla_session):
+    sqla_session.add(User(email="ada@example.com"))
+    sqla_session.commit()
+    assert count(sqla_session) == 1
+
+
+def test_the_commit_was_rolled_back(sqla_session):
+    assert count(sqla_session) == 0
+
+
+def test_who_built_the_schema(sqla_connection):
+    names = inspect(sqla_connection).get_table_names()
+    print("built by", "alembic" if "alembic_version" in names else "create_all")
+"""
+
+
+def test_one_configuration_serves_both_modes(project: Project) -> None:
+    """The ini keeps create_all and its metadata; a CI job adds -o sqla_schema=alembic."""
+    alembic_project(project, tests=BOTH_MODES)
+    project.ini(sqla_schema="create", sqla_metadata="models:Base")
+    created = project.run("-s")
+    created.assert_outcomes(passed=3)
+    created.stdout.fnmatch_lines(["*built by create_all*"])
+    migrated = project.run("-s", "-o", "sqla_schema=alembic")
+    migrated.assert_outcomes(passed=3)
+    migrated.stdout.fnmatch_lines(["*built by alembic*"])
+
+
 COOKBOOK_RECORDS = """
 from pathlib import Path
 
