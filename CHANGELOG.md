@@ -38,10 +38,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   drops its database again, so no worker joins one half migrated, and a
   waiting worker that tries again reports the same error; a database that
   will not drop is marked as a failed migration's, and every worker refuses
-  it. A configured
-  database or a SQLite file is a usage error, and so is an in-memory URI that
-  gives each connection its own database, as in create mode. `sqla_metadata`
-  is ignored, so one configuration serves both modes.
+  it. A configured database or a SQLite file is a usage error, and so is an
+  in-memory URI that gives each connection its own database, as in create
+  mode. `sqla_metadata` is ignored, so one configuration serves both modes.
 - **env.py runs as it is.** It gets an idle connection, as
   `config.attributes["connection"]`, when a synchronous driver is
   configured, and the database's URL as `sqlalchemy.url`; the migrations run

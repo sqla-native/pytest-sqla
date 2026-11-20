@@ -449,9 +449,9 @@ so one that fails, or stops half way, leaves nothing that anything uses:
   more, migrates it, and reports the same error itself. One that will not
   drop, such as on MySQL behind a transaction the migration left open, is
   marked as a failed migration's instead, and every worker refuses it, the
-  error saying so. With `run`, raise
-  `sqla_lock_timeout` above the time your migrations take, or use `worker`,
-  where each worker migrates a database of its own.
+  error saying so. With `run`, raise `sqla_lock_timeout` above the time your
+  migrations take, or use `worker`, where each worker migrates a database of
+  its own.
 - **SQLite in memory**, such as `sqla_url = sqlite://`, once per session. A
   file you named is refused: pytest-sqla never deletes it, so it could not
   give it back empty. So is `sqla_database = configured` on a server, for the
