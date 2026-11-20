@@ -525,6 +525,30 @@ def test_both_runs_are_inside(sqla_session, sqla_database_url):
 """
 
 
+def start(project: Project, command: list[str]) -> subprocess.Popen[bytes]:
+    """A pytest run in a process of its own, its output on one pipe.
+
+    stdin is /dev/null: pytester's default is a pipe it closes at once, which
+    communicate() then fails to flush ("flush of closed file").
+    """
+    return project.pytester.popen(
+        command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL
+    )
+
+
+def stop(run: subprocess.Popen[bytes]) -> None:
+    """Kill a run that is still going, reap it and close its pipe.
+
+    Otherwise its ResourceWarnings surface in whichever later test collects
+    the Popen, and fail that test instead.
+    """
+    if run.poll() is None:
+        run.kill()
+    run.wait()
+    if run.stdout is not None:
+        run.stdout.close()
+
+
 def test_two_runs_at_once_on_one_server_both_pass(
     project: Project, sync_database: Database
 ) -> None:
@@ -537,16 +561,12 @@ def test_two_runs_at_once_on_one_server_both_pass(
     project.tests(BOTH_RUNS_INSIDE.replace("INSIDE_PATH", repr(str(inside))))
     project.write_ini()
     command = [sys.executable, "-m", "pytest", "--sqla-url", sync_database.url]
-    runs = [
-        project.pytester.popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-        for _ in range(2)
-    ]
+    runs = [start(project, command) for _ in range(2)]
     try:
         outputs = [run.communicate(timeout=300)[0].decode() for run in runs]
     finally:
         for run in runs:
-            if run.poll() is None:
-                run.kill()
+            stop(run)
     assert [run.returncode for run in runs] == [0, 0], "\n".join(outputs)
     assert len(list(inside.iterdir())) == 2, "two runs, two databases"
     assert owned_databases(sync_database) == []
@@ -581,7 +601,7 @@ def test_a_killed_worker_leaves_the_database_behind_and_the_next_run_names_it(
     project.tests(KILLED.replace("PIDS_PATH", repr(str(pids))))
     project.write_ini()
     command = [sys.executable, "-m", "pytest", "-n", "2", "--sqla-url", sync_database.url]
-    run = project.pytester.popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    run = start(project, command)
     try:
         deadline = time.monotonic() + 120
         while not [path for path in pids.iterdir() if path.read_text()]:
@@ -592,8 +612,7 @@ def test_a_killed_worker_leaves_the_database_behind_and_the_next_run_names_it(
         os.kill(pid, signal.SIGKILL)
         output = run.communicate(timeout=300)[0].decode()
     finally:
-        if run.poll() is None:
-            run.kill()
+        stop(run)
     assert run.returncode != 0, output
     left = owned_databases(sync_database)
     assert len(left) == 1, output
