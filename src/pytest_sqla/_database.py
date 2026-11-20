@@ -428,10 +428,16 @@ _MISSING_PRIVILEGE = {
 _MISSING_PRIVILEGE[("mariadb", "create", 1044)] = _MISSING_PRIVILEGE[("mysql", "create", 1044)]
 
 
-def _code(error: DBAPIError) -> object:
-    """PostgreSQL's SQLSTATE, or the error number MySQL drivers put first in ``args``."""
+def _code(connection: Connection, error: DBAPIError) -> object:
+    """PostgreSQL's SQLSTATE, or the error number MySQL drivers put first in ``args``.
+
+    The dialect decides which: pymysql 2 sets ``sqlstate`` too, the class
+    (42000 for 1044) rather than the error.
+    """
+    if connection.dialect.name == "postgresql":
+        return getattr(error.orig, "sqlstate", None)
     args = getattr(error.orig, "args", ())
-    return getattr(error.orig, "sqlstate", None) or (args[0] if args else None)
+    return args[0] if args else None
 
 
 def _could_not(
@@ -447,7 +453,9 @@ def _could_not(
             "database is left as it is."
         )
     else:
-        advice = _MISSING_PRIVILEGE.get((connection.dialect.name, step, _code(error)), "")
+        advice = _MISSING_PRIVILEGE.get(
+            (connection.dialect.name, step, _code(connection, error)), ""
+        )
         reason = " " + advice.format(user=owned.admin.username, pattern=name_pattern(owned))
     return SchemaConflictError(
         f"pytest-sqla: could not {step} the database {render(owned.url)} for sqla_database = "
