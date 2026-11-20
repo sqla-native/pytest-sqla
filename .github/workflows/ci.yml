@@ -53,6 +53,11 @@ jobs:
         with:
           fetch-depth: 0
 
+      # sqla_database = run and worker create databases named after the
+      # configured one, and the image grants its user that database only.
+      - name: Let the MySQL user create the databases named after its own
+        run: docker exec -i -e MYSQL_PWD=sqla ${{ job.services.mysql.id }} mysql -uroot < scripts/mysql-init.sql
+
       - uses: astral-sh/setup-uv@v7
       - uses: actions/setup-python@v7
         with:
@@ -196,6 +201,10 @@ jobs:
           --health-interval=3s --health-timeout=5s --health-retries=40
     steps:
       - uses: actions/checkout@v7
+      # sqla_database = run and worker create databases named after the
+      # configured one, and the image grants its user that database only.
+      - name: Let the MySQL user create the databases named after its own
+        run: docker exec -i -e MYSQL_PWD=sqla ${{ job.services.mysql.id }} mysql -uroot < scripts/mysql-init.sql
       - uses: astral-sh/setup-uv@v7
       - uses: actions/setup-python@v7
         with:
@@ -302,6 +311,10 @@ jobs:
       SQLA_TEST_REQUIRE_ALL: "1"
     steps:
       - uses: actions/checkout@v7
+      # sqla_database = run and worker create databases named after the
+      # configured one, and the image grants its user that database only.
+      - name: Let the MySQL user create the databases named after its own
+        run: docker exec -i -e MYSQL_PWD=sqla ${{ job.services.mysql.id }} mysql -uroot < scripts/mysql-init.sql
       - uses: astral-sh/setup-uv@v7
       - uses: actions/setup-python@v7
         with:
@@ -314,6 +327,11 @@ jobs:
       # pytest-xdist runs against both servers.
       - name: The real-database suite, every driver, no skips
         run: python scripts/check_no_skips.py tests/integration -v
+
+      # What a database of pytest-sqla's own adds to a run or a worker on these
+      # servers, the number the README quotes. Informational: it gates nothing.
+      - name: The cost of a database per run or worker
+        run: python scripts/benchmark.py --databases
 
       - name: The examples on PostgreSQL
         env:

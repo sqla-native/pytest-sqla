@@ -8,6 +8,9 @@
 # environment variables are set, so a fork clones and runs green with no Docker.
 # Non-default host ports, so they do not collide with a PostgreSQL or MySQL
 # already listening on 5432 or 3306; MySQL is trimmed to run in little memory.
+# The PostgreSQL user is a superuser, so it may create databases; the MySQL one
+# gets the databases named after its own from scripts/mysql-init.sql, which CI
+# runs too.
 name: pytest-sqla
 services:
   postgres:
@@ -32,6 +35,8 @@ services:
       MYSQL_PASSWORD: sqla
       MYSQL_ROOT_PASSWORD: sqla
     command: ["--innodb-buffer-pool-size=64M", "--performance-schema=OFF", "--max-connections=60"]
+    volumes:
+      - ./scripts/mysql-init.sql:/docker-entrypoint-initdb.d/pytest-sqla.sql:ro
     ports:
       - "127.0.0.1:53308:3306"
     healthcheck:
