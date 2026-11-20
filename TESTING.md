@@ -147,10 +147,10 @@ pytest examples -q
 A FastAPI app tested through `httpx.AsyncClient` with a dependency override,
 under pytest-asyncio and under anyio, and a sync service layer that commits
 through its own sessions. `examples/alembic_app` gets its schema from two
-Alembic migrations, in a session of its own: `pytest examples/alembic_app`. Each example's last test asserts the earlier tests'
-commits were rolled back, so the examples dogfood the plugin's promise. CI
-runs them on SQLite, then on PostgreSQL and MySQL by setting
-`PYTEST_SQLA_URL` and `PYTEST_SQLA_ASYNC_URL`.
+Alembic migrations, in a session of its own: `pytest examples/alembic_app`.
+Each example's last test asserts the earlier tests' commits were rolled back,
+so the examples dogfood the plugin's promise. CI runs them on SQLite, then on
+PostgreSQL and MySQL by setting `PYTEST_SQLA_URL` and `PYTEST_SQLA_ASYNC_URL`.
 
 ## 6. Packaging
 

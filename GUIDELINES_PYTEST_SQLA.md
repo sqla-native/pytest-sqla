@@ -275,18 +275,16 @@ isolation fails, at its own teardown, saying why.
 - Fixtures: `sqla_url`, `sqla_async_url`, `sqla_database_url`,
   `sqla_async_database_url`, `sqla_metadata`, `sqla_engine_options`,
   `sqla_session_options`, `sqla_schema`, `sqla_alembic_config`,
-  `sqla_connection`,
-  `sqla_sessionmaker`, `sqla_session`, `sqla_async_connection`,
-  `sqla_async_sessionmaker`, `sqla_async_session`. `sqla_database_url` and
-  its async twin are what pytest-sqla connects to, read-only in spirit: the
-  way to choose the database is `sqla_url`. Every fixture whose name starts
-  with `_sqla_` is internal and may change.
+  `sqla_connection`, `sqla_sessionmaker`, `sqla_session`,
+  `sqla_async_connection`, `sqla_async_sessionmaker`, `sqla_async_session`.
+  `sqla_database_url` and its async twin are what pytest-sqla connects to,
+  read-only in spirit: the way to choose the database is `sqla_url`. Every
+  fixture whose name starts with `_sqla_` is internal and may change.
 - Options: `--sqla-url`, `--sqla-async-url`, `--sqla-recreate-schema`,
   `--sqla-keep-database`; the `PYTEST_SQLA_URL` and `PYTEST_SQLA_ASYNC_URL`
-  variables; the `sqla_url`, `sqla_async_url`, `sqla_metadata`,
-  `sqla_schema` (`create`, `none` or `alembic`), `sqla_database`,
-  `sqla_lock_timeout`, `sqla_alembic_config`, `sqla_alembic_target` and
-  `sqla_alembic_url` ini keys.
+  variables; the `sqla_url`, `sqla_async_url`, `sqla_metadata`, `sqla_schema`
+  (`create`, `none` or `alembic`), `sqla_database`, `sqla_lock_timeout`,
+  `sqla_alembic_config`, `sqla_alembic_target` and `sqla_alembic_url` ini keys.
   Precedence is command line, then environment, then ini.
 - The report header's `sqla:` line, and its `database=` value: the mode, and
   the name when the configuration determines it.
@@ -393,8 +391,8 @@ green CI without ceremony.
   `scripts/audit_production_surface.py` builds the wheel, installs it with its
   `asyncio` and `alembic` extras into a clean virtualenv, and runs `pip-audit`
   on that closure: SQLAlchemy, pytest and their dependencies, pytest-asyncio
-  and greenlet, and alembic, Mako and MarkupSafe. Advisories confined to dev tooling are Dependabot's job and do not
-  block a release.
+  and greenlet, and alembic, Mako and MarkupSafe. Advisories confined to dev
+  tooling are Dependabot's job and do not block a release.
 - No secrets in code, tests, examples, logs, or docs. The compose and CI
   passwords are throwaway values for throwaway containers.
 

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "pytest-sqla"
-version = "0.0.3"
+version = "0.1.0"
 description = "Per-test SQLAlchemy 2.x sessions that roll back, sync and async, for pytest"
 readme = "README.md"
 authors = [{ name = "Rodrigo Nogueira", email = "rodrigo.b.nogueira@gmail.com" }]
@@ -71,7 +71,8 @@ dev = [
     "aiosqlite>=0.20",
     "greenlet>=3.0",
     "coverage[toml]>=7.10",
-    "complexipy>=6.0",
+    # Scores change between majors, so the local gate needs the one CI runs.
+    "complexipy>=9.0",
     "mypy>=1.9",
     "ruff>=0.4",
     # Drivers for the gated real-database suite. Dev-only: the production

@@ -404,10 +404,9 @@ never touched.
 - **It never hangs.** Creating, joining and leaving run under a lock on the
   configured database, `pg_advisory_lock` or `GET_LOCK`, which waits at most
   `sqla_lock_timeout`, and so does the drop. Before it, pytest-sqla has closed
-  every connection of its own, pooled ones included. On PostgreSQL 13 and
-  later the drop is `WITH (FORCE)`, which also ends the connections of its
-  role that your application leaked, and on older servers pytest-sqla ends
-  them first. On
+  every connection of its own, pooled ones included. On PostgreSQL 13 and later
+  the drop is `WITH (FORCE)`, which also ends the connections of its role that
+  your application leaked, and on older servers pytest-sqla ends them first. On
   MySQL a leaked connection in a transaction holds the drop for
   `sqla_lock_timeout`; the run then fails with SchemaConflictError, saying so,
   and the database stays.
@@ -422,8 +421,11 @@ never touched.
   you can drop them.
 - **Two runs on one server at once** each get their own and both pass, where in
   configured mode the second fails with SchemaConflictError.
-- **The cost** is one CREATE and one DROP per run, or per worker; `python
-  scripts/benchmark.py --databases` measures it on your server.
+- **The cost** is one CREATE and one DROP per run, or per worker. On
+  GitHub's hosted runners, creating and dropping one took 60 to 71 ms on
+  PostgreSQL 17 and 21 to 49 ms on MySQL 8.4, across two CI runs and every
+  driver; `python scripts/benchmark.py --databases` measures it on your
+  server.
 - **No effect on SQLite.** In-memory databases are one per process already, and
   create mode gives each xdist worker a file of its own; the header says
   `database=run (no effect on SQLite)`. Any other dialect is refused.
@@ -687,13 +689,14 @@ tables (MyISAM, MEMORY) cannot be rolled back at all.
 PostgreSQL and MySQL workers of one run share one database, the configured one
 or, with `sqla_database = run`, the run's own; with `sqla_database = worker`
 each has its own. SQLite workers each get their own, a file per worker in
-create mode and an in-memory database per process. Under the default isolation levels a worker never reads another
-worker's rows, because no test commits; pytest-sqla refuses `READ UNCOMMITTED`
-for that reason. The schema is created by the first worker under a database
-lock (`pg_advisory_xact_lock` on PostgreSQL, `GET_LOCK` on MySQL), joined by
-the others, and dropped by the last one out; on SQLite, `BEGIN IMMEDIATE` only
-orders separate runs. Measured before this design: a `create_all` per worker
-with `-n 4` ended "2 passed, 6 errors" on every run against both servers.
+create mode and an in-memory database per process. Under the default isolation
+levels a worker never reads another worker's rows, because no test commits;
+pytest-sqla refuses `READ UNCOMMITTED` for that reason. The schema is created
+by the first worker under a database lock (`pg_advisory_xact_lock` on
+PostgreSQL, `GET_LOCK` on MySQL), joined by the others, and dropped by the last
+one out; on SQLite, `BEGIN IMMEDIATE` only orders separate runs. Measured
+before this design: a `create_all` per worker with `-n 4` ended "2 passed, 6
+errors" on every run against both servers.
 
 Limits:
 
@@ -758,6 +761,10 @@ password.
 | | `--sqlalchemy-manage-db`, `db_schema` | `sqla_database = worker`, and `sqla_schema` for the tables |
 | sqlalchemyseed | your `engine` fixture, the SQLite listeners, StaticPool | `sqla_url`; delete the rest |
 | | `sqlalchemyseed_session` | override it to return `sqla_session`, and keep `seed` |
+| your conftest | a connection, `begin()`, a session bound to it, `rollback()` at teardown | `sqla_session` or `sqla_connection` |
+| | `create_all` and `drop_all` in a session fixture | `sqla_metadata` |
+| | a session fixture that drops and recreates the test database | `sqla_database = run` |
+| | `command.upgrade(config, "head")` in a session fixture | `sqla_schema = alembic` |
 
 pytest-sqlalchemy's `db_schema` and pytest-async-sqlalchemy's `database`
 fixture created and dropped the database, per xdist worker in the former's

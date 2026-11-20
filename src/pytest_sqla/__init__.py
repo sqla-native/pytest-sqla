@@ -22,7 +22,7 @@ __all__ = [
     "SchemaConflictError",
 ]
 
-__version__ = "0.0.3"
+__version__ = "0.1.0"
 
 
 class PytestSqlaError(Exception):
