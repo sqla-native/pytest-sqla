@@ -301,6 +301,7 @@ def read_settings(config: pytest.Config) -> Settings:
         keep_database=bool(config.getoption("--sqla-keep-database")),
     )
     _check_database(config, settings)
+    _check_memory(settings)
     return settings
 
 
@@ -327,6 +328,36 @@ def _check_database(config: pytest.Config, settings: Settings) -> None:
         owned_name(configured.url, settings, longest_worker(config))
     except Refused as refused:
         raise pytest.UsageError(str(refused)) from None
+
+
+def _check_memory(settings: Settings) -> None:
+    """Neither configured URL may give each connection a database of its own, if the schema
+    is pytest-sqla's to build."""
+    for configured in (settings.url, settings.async_url):
+        refusal = None if configured is None else _private_memory(configured.url, settings)
+        if refusal is not None:
+            raise pytest.UsageError(refusal)
+
+
+def _private_memory(url: URL, settings: Settings) -> str | None:
+    """Why the schema cannot be built in ``url``'s database, or None when it can.
+
+    pytest-sqla builds the schema on a connection of its own and runs every
+    test on another, so an in-memory URL that gives each connection a new,
+    empty database leaves the tests without tables. Measured before this
+    check: every test that touched one failed with "no such table", and so did
+    the schema's teardown. With ``sqla_schema = none`` the tests own the
+    schema, and a test's connection can build one in its own database.
+    """
+    if settings.schema_mode == "none" or not _sqlite.is_private_memory(url):
+        return None
+    return (
+        f"pytest-sqla: sqla_schema = {settings.schema_mode} creates the tables on one connection "
+        f"and runs every test on another, but each connection to {render(url)} gets its own "
+        "empty database. Use sqlite://, which pytest-sqla shares as one memdb database for the "
+        "session, or a URI that SQLite shares between connections: file:/NAME?vfs=memdb "
+        "without mode=memory, or one with cache=shared."
+    )
 
 
 def _lock_timeout(config: pytest.Config) -> float:
@@ -519,6 +550,10 @@ def _effective(url: URL | None, settings: Settings, owned: Owned | None) -> URL 
     if _sqlite.is_plain_memory(url):
         _sqlite.require_shared_memory()
         return _sqlite.shared_memory_url(url, settings.memory_name)
+    # The configured URLs were checked at startup; an override is known only now.
+    refusal = _private_memory(url, settings)
+    if refusal is not None:
+        pytest.fail(refusal, pytrace=False)
     if settings.schema_mode == "create" and settings.worker and _sqlite.is_plain_file(url):
         return _sqlite.per_worker_url(url, settings.worker)
     return url

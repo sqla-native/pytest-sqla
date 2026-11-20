@@ -119,7 +119,7 @@ def _unpooled(options: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _thread_safe(url: URL, kwargs: dict[str, Any]) -> dict[str, Any]:
-    if _sqlite.is_shared_memory(url) and url.get_driver_name() == "pysqlite":
+    if _sqlite.is_memory_uri(url) and url.get_driver_name() == "pysqlite":
         # SQLAlchemy sets check_same_thread=False only for what it considers a
         # file database; a test can use its mode=memory connection from a
         # thread too, as Starlette's TestClient does.
@@ -135,7 +135,7 @@ def sync_engine(url: URL, options: Mapping[str, Any]) -> Engine:
         return create_engine(url, **kwargs)
     engine = create_engine(url, **_thread_safe(url, kwargs))
     _sqlite.apply_savepoint_fix(
-        engine, kwargs.get("connect_args", {}), immediate=not _sqlite.is_shared_memory(url)
+        engine, kwargs.get("connect_args", {}), immediate=not _sqlite.is_memory_uri(url)
     )
     return engine
 
@@ -150,7 +150,7 @@ def async_engine(url: URL, options: Mapping[str, Any], *, pooled: bool) -> Async
         _sqlite.apply_savepoint_fix(
             engine.sync_engine,
             kwargs.get("connect_args", {}),
-            immediate=not _sqlite.is_shared_memory(url),
+            immediate=not _sqlite.is_memory_uri(url),
         )
     return engine
 

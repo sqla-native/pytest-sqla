@@ -40,6 +40,24 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   every mode, and its block no longer needs `make_url`.
 - `sqla_metadata` may not define a table named `pytest_sqla_database`.
 
+### Fixed
+
+- **An in-memory SQLite URI that gives each connection a database of its own
+  is refused in create mode**, before the run, instead of failing every test
+  that touches a table with "no such table". pytest-sqla took any URI with
+  `mode=memory`, `vfs=memdb` or `file::memory:` for one that connections
+  share, and created the schema in a database no test connection opened.
+  Measured with two connections to one URI, SQLite shares
+  `file:/NAME?vfs=memdb` and any of them with `cache=shared`, while
+  `file:NAME?mode=memory`, `file::memory:`, `file:NAME?vfs=memdb` and
+  `mode=memory` next to `vfs=memdb`, leading slash or not, give each
+  connection a new, empty one. The usage error names the forms that work:
+  `sqlite://`, `file:/NAME?vfs=memdb` without `mode=memory`, or
+  `cache=shared`. An overridden `sqla_url` fixture gets the same message, in
+  the tests that ask for it. With `sqla_schema = none` such a URL still works,
+  each test's connection with a database of its own, and pytest-sqla no
+  longer holds one more open for the whole session.
+
 ## [0.0.3] - 2026-11-20
 
 ### Fixed
