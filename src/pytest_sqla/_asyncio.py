@@ -436,10 +436,10 @@ def _transaction_fixture(scope: str) -> Callable[..., AsyncIterator[AsyncState]]
 
 def _engine_fixture() -> Callable[..., AsyncIterator[AsyncEngine]]:
     async def engine(
-        _sqla_urls: Targets, sqla_engine_options: dict[str, Any], _sqla_sqlite_keeper: object
+        _sqla_database: Targets, sqla_engine_options: dict[str, Any], _sqla_sqlite_keeper: object
     ) -> AsyncIterator[AsyncEngine]:
-        assert _sqla_urls.asynchronous is not None, "the dispatcher checked the URL"
-        pooled = async_engine(_sqla_urls.asynchronous, sqla_engine_options, pooled=True)
+        assert _sqla_database.asynchronous is not None, "the dispatcher checked the URL"
+        pooled = async_engine(_sqla_database.asynchronous, sqla_engine_options, pooled=True)
         yield pooled
         await pooled.dispose()
 

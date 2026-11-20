@@ -1,4 +1,4 @@
-"""The public surface: twelve fixtures with docstrings, four exceptions, one version."""
+"""The public surface: fourteen fixtures with docstrings, four exceptions, one version."""
 
 from __future__ import annotations
 
@@ -11,6 +11,8 @@ from tests.helpers import Project
 PUBLIC_FIXTURES = [
     "sqla_url",
     "sqla_async_url",
+    "sqla_database_url",
+    "sqla_async_database_url",
     "sqla_metadata",
     "sqla_engine_options",
     "sqla_session_options",

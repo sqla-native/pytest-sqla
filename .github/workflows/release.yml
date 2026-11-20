@@ -54,6 +54,11 @@ jobs:
         with:
           ref: ${{ github.event.inputs.tag || github.ref }}
 
+      # sqla_database = run and worker create databases named after the
+      # configured one, and the image grants its user that database only.
+      - name: Let the MySQL user create the databases named after its own
+        run: docker exec -i -e MYSQL_PWD=sqla ${{ job.services.mysql.id }} mysql -uroot < scripts/mysql-init.sql
+
       - uses: astral-sh/setup-uv@v7
       - uses: actions/setup-python@v7
         with:

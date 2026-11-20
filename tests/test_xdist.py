@@ -1,12 +1,16 @@
-"""pytest-xdist: every worker is its own process, so these run in a subprocess.
+"""pytest-xdist: every worker is its own process.
 
-The real-database half of this - one shared PostgreSQL or MySQL database,
-created once under a lock and dropped by the last worker - is in
-``tests/integration/test_xdist_backends.py``.
+Most of these run in a subprocess. The ones about what the controller does
+run in-process, so coverage sees the controller's hooks; the workers are
+processes of their own either way. The real-database half - one shared
+PostgreSQL or MySQL database, created once under a lock and dropped by the
+last worker, and databases of pytest-sqla's own - is in
+``tests/integration/test_xdist_backends.py`` and ``test_databases.py``.
 """
 
 from __future__ import annotations
 
+import re
 import sys
 
 import pytest
@@ -83,3 +87,67 @@ def test_none_mode_shares_the_file_in_pep_249_mode_too(project: Project) -> None
     )
     project.tests(MANY_TESTS)
     project.run_subprocess("-n", "2").assert_outcomes(passed=9)
+
+
+# ------------------------------------------- the controller and its workers
+
+
+def test_the_controller_hands_its_run_id_to_every_worker(project: Project) -> None:
+    """The controller's header names the databases its workers use.
+
+    xdist generates its own testrun_uid only after the header is printed, so
+    pytest-sqla hands the workers the controller's run id. Nothing connects:
+    these tests never ask for a database.
+    """
+    ids = project.path / "ids"
+    ids.mkdir()
+    project.ini(sqla_url="postgresql+psycopg://ada@db.example/app", sqla_database="worker")
+    project.tests(
+        f"""
+        import pytest
+        from pathlib import Path
+        from pytest_sqla._config import SETTINGS
+
+        @pytest.mark.parametrize("n", range(4))
+        def test_run_id(pytestconfig, worker_id, n):
+            run_id = pytestconfig.stash[SETTINGS].run_id
+            Path({str(ids)!r}, f"{{worker_id}}-{{n}}").write_text(run_id)
+        """
+    )
+    result = project.run("-n", "2")
+    result.assert_outcomes(passed=4)
+    header = re.search(r"database=worker \(app_([0-9a-f]{8})_gwN\)", result.stdout.str())
+    assert header is not None, result.stdout.str()
+    run_ids = {path.read_text() for path in ids.iterdir()}
+    assert len(run_ids) == 1
+    assert run_ids.pop()[:8] == header[1]
+
+
+def test_what_a_worker_announces_reaches_the_controllers_summary(project: Project) -> None:
+    """The way --sqla-keep-database's names reach the terminal, once, from any worker."""
+    project.conftest(
+        """
+        def pytest_sessionfinish(session):
+            output = getattr(session.config, "workeroutput", None)
+            if output is not None:
+                output.setdefault("pytest_sqla", []).append("kept the database example")
+        """
+    )
+    project.tests("def test_one():\n    pass\n\ndef test_two():\n    pass\n")
+    result = project.run("-n", "2")
+    result.assert_outcomes(passed=2)
+    result.stdout.fnmatch_lines(["*- pytest-sqla -*", "kept the database example"])
+    assert result.stdout.str().count("kept the database example") == 1
+
+
+def test_the_controller_checks_the_longest_worker_name(
+    project: Project, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A worker that fails its own check is replaced by xdist, not reported (measured), so
+    the controller refuses a name that fits the run but not the last worker."""
+    monkeypatch.setenv("PYTEST_XDIST_TESTRUNUID", "0123456789abcdef0123456789abcdef")
+    project.ini(sqla_url="postgresql+psycopg://ada@db/" + "a" * 51, sqla_database="worker")
+    project.tests("def test_nothing():\n    pass\n")
+    result = project.run("-n", "2")
+    assert result.ret == pytest.ExitCode.USAGE_ERROR
+    result.stderr.fnmatch_lines(["*would name the database a*_01234567_gw1, which is 64 bytes*"])

@@ -31,8 +31,6 @@ import asyncio
 import contextlib
 import hashlib
 import math
-import os
-import socket
 import threading
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
@@ -46,10 +44,16 @@ from sqlalchemy.engine import URL, Connection
 from sqlalchemy.exc import DBAPIError
 
 from . import SchemaConflictError
-from ._config import render
+from ._config import owner_of, render
 from ._engines import async_schema_engine, schema_engine
 
 MARKER_NAME = "pytest_sqla"
+DATABASE_MARK_NAME = "pytest_sqla_database"
+"""On MySQL, the table that marks a database ``sqla_database = run`` created (``_database``)."""
+_RESERVED = {
+    MARKER_NAME: "to track the schema it creates",
+    DATABASE_MARK_NAME: "to mark the databases it creates on MySQL",
+}
 _ADVISORY_KEY = 0x7079_7465_7374_5351  # "pytestSQ", which fits a signed bigint
 _AUTOCOMMITTING_DDL = frozenset({"mysql", "mariadb"})
 _LOCKING_DIALECTS = frozenset({"postgresql", "mysql", "mariadb", "sqlite"})
@@ -84,16 +88,16 @@ class Plan:
 
     @property
     def owner(self) -> str:
-        return f"{socket.gethostname()}:{os.getpid()}/{self.worker or 'main'}"
+        return owner_of(self.worker)
 
 
 def check_metadatas(metadatas: tuple[MetaData, ...]) -> None:
-    if any(
-        table.name == MARKER_NAME for metadata in metadatas for table in metadata.tables.values()
-    ):
+    names = {table.name for metadata in metadatas for table in metadata.tables.values()}
+    clashes = sorted(names & _RESERVED.keys())
+    if clashes:
         raise SchemaConflictError(
-            "pytest-sqla: your metadata defines a table named pytest_sqla, which pytest-sqla "
-            "uses to track the schema it creates. Rename that table."
+            f"pytest-sqla: your metadata defines a table named {clashes[0]}, which pytest-sqla "
+            f"uses {_RESERVED[clashes[0]]}. Rename that table."
         )
 
 
@@ -209,7 +213,8 @@ def _leave(connection: Connection, plan: Plan) -> str:
 _Work = Callable[[Connection, Plan], str]
 
 
-def _lock_timed_out(connection: Connection, error: DBAPIError) -> bool:
+def lock_timed_out(connection: Connection, error: DBAPIError) -> bool:
+    """Whether ``error`` is the driver's lock wait timeout, on any dialect pytest-sqla locks."""
     dialect = connection.dialect.name
     if dialect == "postgresql":
         return getattr(error.orig, "sqlstate", None) == "55P03"
@@ -268,7 +273,7 @@ def _waiting(connection: Connection, plan: Plan, explain: _Explanation) -> Itera
     try:
         yield
     except DBAPIError as error:
-        if not _lock_timed_out(connection, error):
+        if not lock_timed_out(connection, error):
             raise
         raise explain(plan, error) from error
 
@@ -330,7 +335,7 @@ def _locked(connection: Connection, plan: Plan, work: _Work, ending: bool) -> st
 
 def _in_schema_transaction(plan: Plan, work: _Work, *, ending: bool) -> str:
     if plan.url.get_dialect().is_async:
-        return _in_thread(lambda: asyncio.run(_async_schema_transaction(plan, work, ending)))
+        return in_thread(lambda: asyncio.run(_async_schema_transaction(plan, work, ending)))
     engine = schema_engine(plan.url, plan.engine_options, plan.lock_timeout)
     try:
         with engine.connect() as connection:
@@ -348,7 +353,7 @@ async def _async_schema_transaction(plan: Plan, work: _Work, ending: bool) -> st
         await engine.dispose()
 
 
-def _in_thread(function: Callable[[], _T]) -> _T:
+def in_thread(function: Callable[[], _T]) -> _T:
     """Run ``function`` on a thread of its own, re-raising whatever it raised.
 
     An async-only URL needs an event loop for its DDL. A thread of its own keeps

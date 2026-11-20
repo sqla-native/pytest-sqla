@@ -4,6 +4,42 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **A database of pytest-sqla's own, per run or per xdist worker.**
+  `sqla_database = run` creates one for the pytest run on the configured
+  PostgreSQL or MySQL server, named after the configured database,
+  `app_test_1a2b3c4d`; its xdist workers share it, and the last one out drops
+  it. `sqla_database = worker` gives each worker its own,
+  `app_test_1a2b3c4d_gw0`. pytest-sqla connects to the configured database to
+  create and drop it, under a lock bounded by `sqla_lock_timeout`, marks it as
+  its own (the database's comment on PostgreSQL, a `pytest_sqla_database`
+  table on MySQL), and drops it only when its name, its mark and the mark's
+  run id are this run's; PostgreSQL 13 and later drop `WITH (FORCE)`. A
+  missing CREATEDB or CREATE privilege, a name the server would not take
+  whole, and a database with the run's name that is not its own each get a
+  message that says what to do. `sqla_database = configured`, the default, is
+  the behaviour so far; on SQLite the new modes change nothing.
+- **`--sqla-keep-database`** keeps those databases and names them at the end
+  of the run, from every xdist worker. When a run creates its database, its
+  summary also names the databases other pytest-sqla runs left on the server,
+  such as a killed run's.
+- **`sqla_database_url` and `sqla_async_database_url`**, the URLs pytest-sqla
+  connects to, for your own tools: `sqla_url` and `sqla_async_url` in
+  configured mode on a server.
+
+### Changed
+
+- **The report header ends with `database=`**: the mode, and the database's
+  name when the configuration determines it. Under pytest-xdist the
+  controller now hands its run id to every worker, so the header it prints
+  names the databases they use.
+- **The README's Alembic recipe migrates `sqla_database_url`**, so it works in
+  every mode, and its block no longer needs `make_url`.
+- `sqla_metadata` may not define a table named `pytest_sqla_database`.
+
 ## [0.0.3] - 2026-11-20
 
 ### Fixed

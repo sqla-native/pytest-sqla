@@ -1,6 +1,6 @@
 """Every engine pytest-sqla creates, and the options it refuses to pass on.
 
-Three kinds:
+Four kinds:
 
 * the session-wide **sync engine**: NullPool, so every test gets a DBAPI
   connection of its own, unless ``sqla_engine_options`` choose a pool;
@@ -8,7 +8,10 @@ Three kinds:
   per-test loop, or anyio), which is SQLAlchemy's documented answer for
   multiple loops, and a real pool when the engine lives exactly as long as
   one loop (see ``_asyncio``);
-* short-lived NullPool **schema engines** for DDL (see ``_schema``).
+* short-lived NullPool **schema engines** for DDL (see ``_schema``);
+* short-lived NullPool **admin engines** on the configured database, whose
+  AUTOCOMMIT connections create and drop a database of pytest-sqla's own
+  (see ``_database``).
 
 **Why a fresh connection per test.** ROLLBACK undoes rows, not a session's
 state, and a pooled connection hands that state to the next test. Measured
@@ -178,3 +181,20 @@ def async_schema_engine(url: URL, options: Mapping[str, Any], lock_timeout: floa
     if _sqlite.is_sqlite(url):
         _sqlite.apply_savepoint_fix(engine.sync_engine, kwargs["connect_args"], immediate=True)
     return engine
+
+
+def admin_engine(url: URL, options: Mapping[str, Any]) -> Engine:
+    """For CREATE and DROP DATABASE: NullPool, with the user's options and credentials.
+
+    The caller switches its connection to AUTOCOMMIT, because PostgreSQL runs
+    neither statement inside a transaction block.
+    """
+    check_engine_options(url, options, for_async=False)
+    return create_engine(url, **_unpooled(options))
+
+
+def async_admin_engine(url: URL, options: Mapping[str, Any]) -> AsyncEngine:
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    check_engine_options(url, options, for_async=False)
+    return create_async_engine(url, **_unpooled(options))

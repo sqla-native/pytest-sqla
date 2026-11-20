@@ -15,10 +15,12 @@ repeats it, password included.
 
 from __future__ import annotations
 
+import hashlib
 import importlib
 import math
 import os
 import re
+import socket
 import uuid
 from dataclasses import dataclass
 from typing import Literal
@@ -31,7 +33,10 @@ from sqlalchemy.exc import ArgumentError
 from . import _sqlite
 
 SCHEMA_MODES = ("create", "none")
+DATABASE_MODES = ("configured", "run", "worker")
 DEFAULT_LOCK_TIMEOUT = 30.0
+RUN_ID_KEY = "pytest_sqla_run_id"
+"""The key under which an xdist controller hands its run id to every worker."""
 # pytest 9's native TOML ([tool.pytest], pytest.toml) type-checks values: a
 # string option refused sqla_lock_timeout = 30 with an INTERNALERROR. pytest
 # 8.4 added the float type, which takes a number there and parses one in ini
@@ -42,6 +47,13 @@ _LOCK_TIMEOUT_TYPE: Literal["float", "string"] = (
 
 _METADATA_PATH = re.compile(r"[A-Za-z_][\w.]*:[A-Za-z_][\w.]*")
 _DEFAULT_PORTS = {"postgresql": 5432, "mysql": 3306}
+_HEX = re.compile(r"[0-9a-f]{8}")
+# How long a database name may be. PostgreSQL counts bytes and shortens a
+# longer name with only a NOTICE (NAMEDATALEN - 1, "longer names ... will be
+# truncated", PostgreSQL 17 docs); MySQL counts characters and refuses one.
+_NAME_LIMITS = {"postgresql": 63, "mysql": 64, "mariadb": 64}
+_NAME_UNITS = {"postgresql": "bytes", "mysql": "characters", "mariadb": "characters"}
+_SERVERS = {"postgresql": "PostgreSQL", "mysql": "MySQL", "mariadb": "MariaDB"}
 
 
 @dataclass(frozen=True)
@@ -79,9 +91,123 @@ class Settings:
     worker: str | None
     memory_name: str
     """The memdb database this session's in-memory SQLite URLs become."""
+    database_mode: str
+    """``configured``, or ``run`` and ``worker``: a database of pytest-sqla's own."""
+    keep_database: bool
+
+    @property
+    def configured(self) -> ConfiguredURL | None:
+        """The URL a database of pytest-sqla's own is named after: the sync one if set."""
+        return self.url or self.async_url
 
 
 SETTINGS = pytest.StashKey[Settings]()
+
+
+def owner_of(worker: str | None) -> str:
+    """Who created a marker or a database: ``host:pid/worker``."""
+    return f"{socket.gethostname()}:{os.getpid()}/{worker or 'main'}"
+
+
+class Refused(ValueError):
+    """A database pytest-sqla cannot create for this URL; the message says why."""
+
+
+@dataclass(frozen=True)
+class Owned:
+    """A database ``sqla_database = run`` or ``worker`` creates, uses and drops.
+
+    Only one built here is ever dropped, and only after the three checks in
+    ``_database``: its name derives from this run's id, it carries
+    pytest-sqla's mark, and the mark says this run created it.
+    """
+
+    admin: URL
+    """The configured URL: the database pytest-sqla connects to for CREATE and DROP."""
+    name: str
+    mode: str
+    run_id: str
+    worker: str | None
+    lock_timeout: float
+    keep: bool
+
+    @property
+    def url(self) -> URL:
+        return self.admin.set(database=self.name)
+
+
+def run8(run_id: str) -> str:
+    """The run id's first 8 hex digits, or 8 of its SHA-256 when it does not start with them."""
+    head = run_id[:8]
+    return head if _HEX.fullmatch(head) else hashlib.sha256(run_id.encode()).hexdigest()[:8]
+
+
+def derived_name(database: str, mode: str, run_id: str, worker: str | None) -> str:
+    """``app_1a2b3c4d`` for the run, ``app_1a2b3c4d_gw0`` for one xdist worker."""
+    suffix = f"_{worker}" if mode == "worker" and worker else ""
+    return f"{database}_{run8(run_id)}{suffix}"
+
+
+def owned_name(url: URL, settings: Settings, worker: str | None) -> str | None:
+    """The database ``sqla_database`` creates instead of ``url``'s, or None.
+
+    None in configured mode and on SQLite, where every database pytest-sqla
+    makes up is one per process or per worker already. Raises Refused for any
+    other dialect, for a URL that names no database, and for a name the server
+    would not take whole.
+    """
+    mode = settings.database_mode
+    if mode == "configured" or _sqlite.is_sqlite(url):
+        return None
+    backend = url.get_backend_name()
+    if backend not in _NAME_LIMITS:
+        raise Refused(
+            f"pytest-sqla: sqla_database = {mode} creates databases on PostgreSQL, MySQL and "
+            f"MariaDB, and has no effect on SQLite; {render(url)} is {backend}. Set sqla_database "
+            "= configured and create the database before the run."
+        )
+    if not url.database:
+        raise Refused(
+            f"pytest-sqla: sqla_database = {mode} names its database after the one in the URL, "
+            f"but {render(url)} names none. Add the database pytest-sqla should connect to, for "
+            "example /postgres on PostgreSQL."
+        )
+    name = derived_name(url.database, mode, settings.run_id, worker)
+    length = len(name.encode()) if backend == "postgresql" else len(name)
+    if length > _NAME_LIMITS[backend]:
+        raise Refused(
+            f"pytest-sqla: sqla_database = {mode} would name the database {name}, which is "
+            f"{length} {_NAME_UNITS[backend]} long, but {_SERVERS[backend]} takes at most "
+            f"{_NAME_LIMITS[backend]}. Shorten the database name in the URL."
+        )
+    return name
+
+
+def longest_worker(config: pytest.Config) -> str | None:
+    """The longest xdist worker id in this run's database names, for the length check.
+
+    A worker knows its own. The controller knows how many it starts: xdist has
+    turned ``-n`` into a number before any plugin's pytest_configure. A worker
+    that fails its own check is replaced by xdist rather than reported
+    (measured), so the controller is where a usage error can stop the run.
+    """
+    processes = config.getoption("numprocesses", None)
+    started = f"gw{processes - 1}" if isinstance(processes, int) and processes > 0 else None
+    return os.environ.get("PYTEST_XDIST_WORKER") or started
+
+
+def describe_database(settings: Settings, *, distributed: bool) -> str:
+    """The report header's ``database=`` value: the mode, and the name when it is known."""
+    mode = settings.database_mode
+    configured = settings.configured
+    if mode == "configured" or configured is None:
+        return mode
+    if _sqlite.is_sqlite(configured.url):
+        return f"{mode} (no effect on SQLite)"
+    database = configured.url.database
+    assert database is not None, "owned_name refused a URL without a database at configure time"
+    worker = settings.worker or ("gwN" if distributed else None)
+    return f"{mode} ({derived_name(database, mode, settings.run_id, worker)})"
 
 
 def add_options(parser: pytest.Parser) -> None:
@@ -105,6 +231,12 @@ def add_options(parser: pytest.Parser) -> None:
         default=False,
         help="Replace the schema a crashed pytest-sqla run left behind instead of refusing it.",
     )
+    group.addoption(
+        "--sqla-keep-database",
+        action="store_true",
+        default=False,
+        help="Keep the databases sqla_database = run or worker created, and print their names.",
+    )
     parser.addini(URL_ORIGIN.ini, "Database URL for the sqla fixtures.", default="")
     parser.addini(ASYNC_URL_ORIGIN.ini, "URL for the async sqla fixtures.", default="")
     parser.addini(
@@ -122,6 +254,12 @@ def add_options(parser: pytest.Parser) -> None:
         "Seconds to wait for the schema lock, for DDL locks and for a test's rollback. Default 30.",
         type=_LOCK_TIMEOUT_TYPE,
         default=DEFAULT_LOCK_TIMEOUT,
+    )
+    parser.addini(
+        "sqla_database",
+        "'configured' (default): use the configured database. 'run': create one for the run. "
+        "'worker': create one per xdist worker. PostgreSQL and MySQL.",
+        default="configured",
     )
 
 
@@ -145,17 +283,50 @@ def read_settings(config: pytest.Config) -> Settings:
         mismatch = _mismatch(url.url, async_url.url, (url.source, async_url.source))
         if mismatch is not None:
             raise pytest.UsageError(mismatch)
-    return Settings(
+    settings = Settings(
         url=url,
         async_url=async_url,
         metadata_path=metadata_path,
         schema_mode=schema_mode,
         lock_timeout=lock_timeout,
         recreate_schema=bool(config.getoption("--sqla-recreate-schema")),
-        run_id=os.environ.get("PYTEST_XDIST_TESTRUNUID") or uuid.uuid4().hex,
+        # A worker takes the id its xdist controller handed it, so the
+        # controller's report header can name the databases the workers use.
+        run_id=getattr(config, "workerinput", {}).get(RUN_ID_KEY)
+        or os.environ.get("PYTEST_XDIST_TESTRUNUID")
+        or uuid.uuid4().hex,
         worker=os.environ.get("PYTEST_XDIST_WORKER") or None,
         memory_name=f"pytest-sqla-{uuid.uuid4().hex}",
+        database_mode=_database_mode(config),
+        keep_database=bool(config.getoption("--sqla-keep-database")),
     )
+    _check_database(config, settings)
+    return settings
+
+
+def _database_mode(config: pytest.Config) -> str:
+    mode = str(config.getini("sqla_database"))
+    if mode not in DATABASE_MODES:
+        raise pytest.UsageError(
+            f"pytest-sqla: sqla_database must be 'configured', 'run' or 'worker', got {mode!r}."
+        )
+    return mode
+
+
+def _check_database(config: pytest.Config, settings: Settings) -> None:
+    """The configured URL must admit a database of pytest-sqla's own, if one is asked for."""
+    if settings.keep_database and settings.database_mode == "configured":
+        raise pytest.UsageError(
+            "pytest-sqla: --sqla-keep-database keeps the databases sqla_database = run and worker "
+            "create, and sqla_database = configured creates none."
+        )
+    configured = settings.configured
+    if configured is None:
+        return
+    try:
+        owned_name(configured.url, settings, longest_worker(config))
+    except Refused as refused:
+        raise pytest.UsageError(str(refused)) from None
 
 
 def _lock_timeout(config: pytest.Config) -> float:
@@ -255,8 +426,9 @@ class Targets:
     """What pytest-sqla actually connects to, derived from the configured URLs.
 
     The configured values are never changed. An in-memory SQLite URL becomes a
-    memdb name, and in create mode under xdist a SQLite file gains a ``-gwN``
-    suffix; the result is what ``sqla_connection.engine.url`` shows.
+    memdb name, in create mode under xdist a SQLite file gains a ``-gwN``
+    suffix, and ``sqla_database = run`` or ``worker`` names a database of its
+    own on the same server; the result is ``sqla_database_url``.
     """
 
     sync: URL | None
@@ -268,8 +440,11 @@ class Targets:
     worker_file: str | None
     """A per-worker SQLite file this run creates and deletes."""
     disposable: bool
-    """The database is one pytest-sqla made up, a memdb name or a per-worker
-    file, so it is discarded at the end instead of having its tables dropped."""
+    """The database is one pytest-sqla made up - a memdb name, a per-worker
+    file, or a database of its own - so it is discarded at the end instead of
+    having its tables dropped."""
+    owned: Owned | None = None
+    """The database ``sqla_database = run`` or ``worker`` creates and drops."""
 
     @property
     def ddl(self) -> URL | None:
@@ -284,9 +459,10 @@ def resolve_targets(sync_value: object, async_value: object, settings: Settings)
     if mismatch is not None:
         pytest.fail(mismatch, pytrace=False)
     async_setting = "sqla_url" if asynchronous == sync else "sqla_async_url"
+    owned = _owned(sync or asynchronous, settings)
     memory = any(_sqlite.is_plain_memory(url) for url in (sync, asynchronous) if url is not None)
-    sync = _effective(sync, settings)
-    asynchronous = _effective(asynchronous, settings)
+    sync = _effective(sync, settings, owned)
+    asynchronous = _effective(asynchronous, settings, owned)
     connected = [url for url in (sync, asynchronous) if url is not None]
     shared = [url for url in connected if _sqlite.is_shared_memory(url)]
     derived = settings.schema_mode == "create" and settings.worker is not None
@@ -297,7 +473,32 @@ def resolve_targets(sync_value: object, async_value: object, settings: Settings)
         async_setting=async_setting,
         keeper=_sqlite.keeper_target(shared[0]) if shared else None,
         worker_file=str(files[0].database) if files else None,
-        disposable=memory or bool(files),
+        disposable=memory or bool(files) or owned is not None,
+        owned=owned,
+    )
+
+
+def _owned(url: URL | None, settings: Settings) -> Owned | None:
+    """The database of its own this run or worker uses instead of ``url``'s, if any.
+
+    ``url`` is the fixture's value: an override of sqla_url, such as a
+    container's URL, is the base the name derives from. The same checks ran
+    on the configured URL at startup; here they fail the test that asked.
+    """
+    try:
+        name = None if url is None else owned_name(url, settings, settings.worker)
+    except Refused as refused:
+        pytest.fail(str(refused), pytrace=False)
+    if url is None or name is None:
+        return None
+    return Owned(
+        admin=url,
+        name=name,
+        mode=settings.database_mode,
+        run_id=settings.run_id,
+        worker=settings.worker,
+        lock_timeout=settings.lock_timeout,
+        keep=settings.keep_database,
     )
 
 
@@ -310,9 +511,11 @@ def _fixture_url(value: object, setting: str) -> URL | None:
     return url
 
 
-def _effective(url: URL | None, settings: Settings) -> URL | None:
+def _effective(url: URL | None, settings: Settings, owned: Owned | None) -> URL | None:
     if url is None:
         return None
+    if owned is not None:
+        return url.set(database=owned.name)
     if _sqlite.is_plain_memory(url):
         _sqlite.require_shared_memory()
         return _sqlite.shared_memory_url(url, settings.memory_name)
