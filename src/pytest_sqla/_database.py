@@ -189,7 +189,7 @@ class _PostgreSQL(_Server):
         # A setting of this connection only: it is pytest-sqla's own, and closes with the lock.
         connection.exec_driver_sql(f"SET lock_timeout = '{milliseconds}ms'")
         try:
-            connection.execute(select(func.pg_advisory_lock(lock_key(owned.name))))
+            connection.scalar(select(func.pg_advisory_lock(lock_key(owned.name))))
         except DBAPIError as error:
             raise _waited_too_long(owned, error) from error
 
@@ -211,7 +211,7 @@ class _PostgreSQL(_Server):
     ) -> None:
         """End the database's sessions, then drop it; ``version`` is for the tests."""
         server = version or connection.dialect.server_version_info or (0,)
-        connection.execute(_END_SESSIONS, {"name": owned.name})
+        connection.execute(_END_SESSIONS, {"name": owned.name}).all()
         # FORCE (13+) also ends a session that connected after the line above.
         force = " WITH (FORCE)" if int(server[0]) >= 13 else ""
         connection.exec_driver_sql(f"DROP DATABASE {_quoted(connection, owned.name)}{force}")
