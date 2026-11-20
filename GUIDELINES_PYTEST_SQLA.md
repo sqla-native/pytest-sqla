@@ -204,23 +204,29 @@ isolation fails, at its own teardown, saying why.
   mark's run id is this run's. The mark is the database's comment on
   PostgreSQL; MySQL 8.4 has no comment on a database, so there it is a
   one-row `pytest_sqla_database` table inside. A database with the name but
-  not the mark is refused at creation and left alone at the end. Measured: a
-  fixture that drops and creates one test database in every worker fails
-  under `-n 4`; `run` passes.
+  not the mark is refused at creation and left alone at the end, and one that
+  could not be marked is dropped again: it is the process's own, created a
+  moment ago under the lock. The control in the real-database suite: a fixture
+  that drops and creates one test database in every worker fails under
+  `-n 4`, and `run` passes.
 - **One lock per database name, held across the whole step.** Create-or-join
   and leave-then-drop each run under a session-level lock on the configured
   database, `pg_advisory_lock` or `GET_LOCK`, keyed by the derived name, so
   a late worker either joins a live database or creates it again, never one
-  being dropped, and separate runs never wait for each other. The mark counts
+  being dropped, and separate runs never queue for one lock. The mark counts
   the workers inside; the one that brings it to 0 drops. Every fixture that
   connects depends on the one that drops, so pytest-sqla's own engines,
-  pooled ones included, are disposed before the DROP (measured: no session
-  left on the database). PostgreSQL 13+ drops `WITH (FORCE)`, after ending the
-  database's sessions as earlier versions need; MySQL's DROP waits for a
-  leaked transaction, bounded by `lock_wait_timeout`.
-- **Check names before the run.** PostgreSQL cuts a name past 63 bytes with
-  only a NOTICE (measured), so two derived names could become one; MySQL
-  takes 64 characters. A name too long is a usage error, checked by the xdist
+  pooled ones included, are disposed before the DROP; the suite counts the
+  sessions left on the database at the drop. PostgreSQL 13+ drops `WITH
+  (FORCE)`, after ending the database's client sessions as earlier versions
+  need (never autovacuum's: DROP ends those itself, and only a superuser may
+  signal them); MySQL's DROP waits for a leaked transaction, bounded by
+  `lock_wait_timeout`. Looking for databases other runs left is best effort:
+  on MySQL a mark that another run's DROP keeps locked is skipped after a
+  second.
+- **Check names before the run.** PostgreSQL truncates a name past 63 bytes
+  without an error, so two derived names could become one, and a control in
+  the suite shows it; MySQL takes 64 characters. A name too long is a usage error, checked by the xdist
   controller for its longest worker id, because a worker that fails its own
   configure is replaced by xdist rather than reported (measured).
 - **One run id per run.** The xdist controller hands its own to every worker

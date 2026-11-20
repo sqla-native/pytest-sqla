@@ -388,15 +388,15 @@ never touched.
   configured database, `pg_advisory_lock` or `GET_LOCK`, which waits at most
   `sqla_lock_timeout`, and so does the drop. Before it, pytest-sqla has closed
   every connection of its own, pooled ones included. On PostgreSQL 13 and
-  later the drop is `WITH (FORCE)`, which also ends the connections your
-  application leaked, and on older servers pytest-sqla ends them first. On
+  later the drop is `WITH (FORCE)`, which also ends the connections of its
+  role that your application leaked, and on older servers pytest-sqla ends
+  them first. On
   MySQL a leaked connection in a transaction holds the drop for
   `sqla_lock_timeout`; the run then fails with SchemaConflictError, saying so,
   and the database stays.
-- **Names are checked before the run.** PostgreSQL takes 63 bytes and cuts a
-  longer name to that with only a NOTICE (measured), so two names could become
-  one; MySQL takes 64 characters. A derived name that is too long is a usage
-  error.
+- **Names are checked before the run.** PostgreSQL takes 63 bytes and
+  truncates a longer name without an error, so two names could become one;
+  MySQL takes 64 characters. A derived name that is too long is a usage error.
 - **Keep it for a look.** `--sqla-keep-database` keeps the databases, tables
   included, and the end of the run names them, under xdist too.
 - **A killed run leaves its database.** A worker killed with `kill -9` never
