@@ -244,6 +244,7 @@ jobs:
       - run: pytest -q
       - run: uv pip install --system -r examples/requirements.txt "sqlalchemy[asyncio]>=2.0,<2.1"
       - run: pytest examples -q
+      - run: pytest examples/alembic_app -q
 
   sync-only:
     name: Sync-only install
@@ -345,6 +346,17 @@ jobs:
           PYTEST_SQLA_ASYNC_URL: ${{ env.SQLA_TEST_MYSQL_AIOMYSQL_URL }}
         run: python scripts/check_no_skips.py examples -q
 
+      # Its own session, migrated by Alembic into a database of the run's own.
+      - name: The Alembic example on PostgreSQL
+        env:
+          PYTEST_SQLA_URL: ${{ env.SQLA_TEST_POSTGRES_PSYCOPG_URL }}
+        run: python scripts/check_no_skips.py examples/alembic_app -q
+
+      - name: The Alembic example on MySQL
+        env:
+          PYTEST_SQLA_URL: ${{ env.SQLA_TEST_MYSQL_PYMYSQL_URL }}
+        run: python scripts/check_no_skips.py examples/alembic_app -q
+
   examples:
     name: Examples
     runs-on: ubuntu-latest
@@ -359,6 +371,7 @@ jobs:
       - run: uv pip install --system -e . --group dev
       - run: uv pip install --system -r examples/requirements.txt
       - run: pytest examples -q
+      - run: pytest examples/alembic_app -q
 
   packaging:
     name: Packaging and supply chain

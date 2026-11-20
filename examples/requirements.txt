@@ -4,5 +4,7 @@ aiosqlite>=0.20
 pytest>=8.2
 pytest-asyncio>=1.2
 pytest-sqla
+# The Alembic example, sqla_schema = alembic.
+alembic>=1.16
 # SQLAlchemy 2.1 no longer installs greenlet, which the async example needs.
 sqlalchemy[asyncio]>=2.0
