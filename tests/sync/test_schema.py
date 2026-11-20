@@ -219,13 +219,22 @@ def test_a_dropped_marker_fails_the_teardown_and_drops_nothing(
     assert table_names(database) == ["note", "user_account"]
 
 
-def test_a_metadata_table_named_like_the_marker_is_refused(project: Project) -> None:
+@pytest.mark.parametrize(
+    ("table", "purpose"),
+    [
+        ("pytest_sqla", "to track the schema it creates"),
+        ("pytest_sqla_database", "to mark the databases it creates on MySQL"),
+    ],
+)
+def test_a_metadata_table_named_like_a_marker_is_refused(
+    project: Project, table: str, purpose: str
+) -> None:
     project.models(
-        """
+        f"""
         from sqlalchemy import Column, Integer, MetaData, Table
 
         metadata = MetaData()
-        Table("pytest_sqla", metadata, Column("id", Integer, primary_key=True))
+        Table({table!r}, metadata, Column("id", Integer, primary_key=True))
         """,
         name="clash",
     )
@@ -237,8 +246,7 @@ def test_a_metadata_table_named_like_the_marker_is_refused(project: Project) -> 
     result.stdout.fnmatch_lines(
         [
             "E *pytest_sqla.SchemaConflictError: pytest-sqla: your metadata defines a table "
-            "named pytest_sqla, which pytest-sqla uses to track the schema it creates. Rename "
-            "that table."
+            f"named {table}, which pytest-sqla uses {purpose}. Rename that table."
         ]
     )
 

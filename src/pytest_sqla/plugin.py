@@ -19,16 +19,16 @@ from collections.abc import AsyncIterator, Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
-from typing import TYPE_CHECKING, Any, NoReturn
+from typing import TYPE_CHECKING, Any, NoReturn, TypeVar
 
 import pytest
 from sqlalchemy.engine import URL, Connection, Engine
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import Session, sessionmaker
 
-from . import SchemaConflictError, _asyncio, _config, _schema, _sqlite
+from . import SchemaConflictError, _asyncio, _config, _database, _schema, _sqlite
 from ._asyncio import AsyncState
-from ._config import SETTINGS, Settings, Targets
+from ._config import SETTINGS, Settings, Targets, render
 from ._engines import async_engine, sync_engine
 from ._isolation import Isolation, check_session_options, end_isolation, open_isolation
 
@@ -58,6 +58,11 @@ _ASYNC_DRIVERS = {
     "mariadb": "mariadb+aiomysql",
     "sqlite": "sqlite+aiosqlite",
 }
+_ANNOUNCED = pytest.StashKey[list[str]]()
+"""Lines for the terminal summary, such as the databases --sqla-keep-database kept."""
+_WORKER_OUTPUT = "pytest_sqla"
+"""The key an xdist worker hands those lines to its controller under."""
+_T = TypeVar("_T")
 
 
 # ---------------------------------------------------------------------- hooks
@@ -69,24 +74,64 @@ def pytest_addoption(parser: pytest.Parser) -> None:
 
 def pytest_configure(config: pytest.Config) -> None:
     config.stash[SETTINGS] = _config.read_settings(config)
+    config.stash[_ANNOUNCED] = []
 
 
 def pytest_report_header(config: pytest.Config) -> list[str]:
     """Say which database the run is configured for, so a green CI log shows what it proved.
 
     This is the configuration: an override of the sqla_url fixture, such as a
-    container's URL, is not known before the first database test, and the
-    connected URL is ``sqla_connection.engine.url``.
+    container's URL, is not known before the first database test, and the URL
+    pytest-sqla connects to is ``sqla_database_url``. Under pytest-xdist the
+    controller prints it, with the run id it hands its workers.
     """
     settings = config.stash[SETTINGS]
     parts = [
-        f"{label}={_config.render(configured.url)} (from {configured.source})"
+        f"{label}={render(configured.url)} (from {configured.source})"
         for label, configured in (("url", settings.url), ("async_url", settings.async_url))
         if configured is not None
     ]
     if not parts:
         return []
-    return [f"sqla: {', '.join(parts)}, schema={settings.schema_mode}"]
+    database = _config.describe_database(
+        settings, distributed=config.pluginmanager.has_plugin("dsession")
+    )
+    return [f"sqla: {', '.join(parts)}, schema={settings.schema_mode}, database={database}"]
+
+
+@pytest.hookimpl(optionalhook=True)
+def pytest_configure_node(node: Any) -> None:
+    """pytest-xdist, in the controller: hand the worker this run's id.
+
+    Every name derived from it then agrees, the controller's report header
+    included, which xdist prints before it generates its own testrun_uid.
+    """
+    node.workerinput[_config.RUN_ID_KEY] = node.config.stash[SETTINGS].run_id
+
+
+@pytest.hookimpl(optionalhook=True)
+def pytest_testnodedown(node: Any, error: object) -> None:
+    """pytest-xdist, in the controller: collect what a worker announced, for the summary.
+
+    A worker that crashed sends nothing, so it has no ``workeroutput``.
+    """
+    lines = getattr(node, "workeroutput", {}).get(_WORKER_OUTPUT, [])
+    node.config.stash[_ANNOUNCED].extend(lines)
+
+
+def pytest_terminal_summary(terminalreporter: pytest.TerminalReporter) -> None:
+    lines = terminalreporter.config.stash[_ANNOUNCED]
+    if lines:
+        terminalreporter.section("pytest-sqla", sep="-")
+        for line in sorted(set(lines)):
+            terminalreporter.write_line(line)
+
+
+def _announce(config: pytest.Config, line: str) -> None:
+    """A line for the terminal summary; an xdist worker hands it to its controller."""
+    output = getattr(config, "workeroutput", None)
+    own = config.stash[_ANNOUNCED]
+    (own if output is None else output.setdefault(_WORKER_OUTPUT, [])).append(line)
 
 
 # ------------------------------------------------------- configuration fixtures
@@ -99,8 +144,9 @@ def sqla_url(request: pytest.FixtureRequest) -> URL | None:
     From ``--sqla-url``, then ``PYTEST_SQLA_URL``, then the ``sqla_url`` ini key.
     Override it in a conftest to compute the URL, for example from a
     testcontainers or pytest-databases fixture; a str or a URL is accepted.
-    pytest-sqla never changes this value: the URL it connects to, which may
-    differ for in-memory SQLite and xdist, is ``sqla_connection.engine.url``.
+    pytest-sqla never changes this value: the URL it connects to, which
+    differs for in-memory SQLite, xdist, and ``sqla_database = run`` or
+    ``worker``, is ``sqla_database_url``.
     """
     configured = _settings(request).url
     return None if configured is None else configured.url
@@ -117,6 +163,30 @@ def sqla_async_url(request: pytest.FixtureRequest, sqla_url: URL | str | None) -
     """
     configured = _settings(request).async_url
     return sqla_url if configured is None else configured.url
+
+
+@pytest.fixture(scope="session")
+def sqla_database_url(_sqla_database: Targets, _sqla_sqlite_keeper: object) -> URL | None:
+    """The URL pytest-sqla connects to: what the tests, its engines and the schema use.
+
+    ``sqla_url`` itself in configured mode on a server; with ``sqla_database =
+    run`` or ``worker``, the database pytest-sqla created for this run or
+    worker, which exists while this fixture does; on SQLite, the shared
+    in-memory database or the per-worker file. Use it to point your own tools,
+    such as Alembic, at the test database. To choose the database, override
+    ``sqla_url`` instead: this is what pytest-sqla made of it.
+    """
+    return _sqla_database.sync
+
+
+@pytest.fixture(scope="session")
+def sqla_async_database_url(_sqla_database: Targets, _sqla_sqlite_keeper: object) -> URL | None:
+    """The URL the async fixtures connect to: ``sqla_database_url``'s async twin.
+
+    ``sqla_async_url`` itself in configured mode on a server, and the same
+    database as ``sqla_database_url`` otherwise, through the async driver.
+    """
+    return _sqla_database.asynchronous
 
 
 @pytest.fixture(scope="session")
@@ -171,12 +241,14 @@ def sqla_schema(request: pytest.FixtureRequest) -> Iterator[None]:
     run under a database-level lock, joined by sibling xdist workers, and
     dropped by the last one out. Tables pytest-sqla did not create are refused,
     never dropped. With ``sqla_schema = none`` it does nothing. Override it to
-    build the schema yourself, for example with Alembic.
+    build the schema yourself, for example with Alembic on
+    ``sqla_database_url``.
 
-    A SQLite database pytest-sqla made up - an in-memory one, or a per-worker
-    file - is discarded at the end instead. On Python 3.11 and later an
-    unread result a failing test left behind keeps a SQLite read lock until it
-    is garbage-collected, and pytest keeps the last failure's traceback, so a
+    A database pytest-sqla made up - an in-memory or per-worker SQLite one, or
+    one ``sqla_database = run`` or ``worker`` created - is discarded at the end
+    instead, its tables with it. On Python 3.11 and later an unread result a
+    failing test left behind keeps a SQLite read lock until it is
+    garbage-collected, and pytest keeps the last failure's traceback, so a
     DROP there would wait out the lock timeout.
     """
     __tracebackhide__ = True
@@ -184,7 +256,7 @@ def sqla_schema(request: pytest.FixtureRequest) -> Iterator[None]:
     if settings.schema_mode == "none":
         yield
         return
-    targets: Targets = request.getfixturevalue("_sqla_urls")
+    targets: Targets = request.getfixturevalue("_sqla_database")
     url = targets.ddl
     if url is None:
         _no_database("sqla_schema")
@@ -198,11 +270,12 @@ def sqla_schema(request: pytest.FixtureRequest) -> Iterator[None]:
             Path(targets.worker_file + suffix).unlink(missing_ok=True)
 
 
-def _reported(step: Callable[[_schema.Plan], str], plan: _schema.Plan) -> None:
-    """Run a schema step; a SchemaConflictError is re-raised here, without the DDL frames."""
+def _reported(step: Callable[..., _T], *args: Any) -> _T:
+    """Run a schema or database step; a SchemaConflictError is re-raised here, without
+    the DDL frames."""
     __tracebackhide__ = True
     try:
-        step(plan)
+        return step(*args)
     except SchemaConflictError as error:
         raise SchemaConflictError(*error.args) from None
 
@@ -237,7 +310,35 @@ def _schema_plan(request: pytest.FixtureRequest, settings: Settings, url: URL) -
 
 @pytest.fixture(scope="session")
 def _sqla_urls(request: pytest.FixtureRequest, sqla_url: object, sqla_async_url: object) -> Targets:
+    """What pytest-sqla will connect to, worked out without connecting."""
     return _config.resolve_targets(sqla_url, sqla_async_url, _settings(request))
+
+
+@pytest.fixture(scope="session")
+def _sqla_database(
+    request: pytest.FixtureRequest, _sqla_urls: Targets, sqla_engine_options: dict[str, Any]
+) -> Iterator[Targets]:
+    """The database ``sqla_database = run`` or ``worker`` uses: created or joined, then left.
+
+    Every fixture that connects depends on this one, so pytest tears all of
+    them down first: pytest-sqla's own engines are disposed before the last
+    worker out drops the database.
+    """
+    __tracebackhide__ = True
+    owned = _sqla_urls.owned
+    if owned is None:
+        yield _sqla_urls
+        return
+    _, left_behind = _reported(_database.join, owned, sqla_engine_options)
+    for line in left_behind:
+        _announce(request.config, line)
+    yield _sqla_urls
+    if _reported(_database.leave, owned, sqla_engine_options) == "kept":
+        _announce(
+            request.config,
+            f"kept the database {render(owned.url)}, as --sqla-keep-database asked; drop "
+            f"{owned.name} when you are done with it.",
+        )
 
 
 @pytest.fixture(scope="session")
@@ -258,11 +359,11 @@ def _sqla_sqlite_keeper(_sqla_urls: Targets) -> Iterator[sqlite3.Connection | No
 
 @pytest.fixture(scope="session")
 def _sqla_sync_engine(
-    _sqla_urls: Targets, sqla_engine_options: dict[str, Any], _sqla_sqlite_keeper: object
+    _sqla_database: Targets, sqla_engine_options: dict[str, Any], _sqla_sqlite_keeper: object
 ) -> Iterator[Engine]:
     """NullPool, unless sqla_engine_options choose a pool: see ``_engines``."""
-    assert _sqla_urls.sync is not None, "the dispatcher checked the URL"
-    engine = sync_engine(_sqla_urls.sync, sqla_engine_options)
+    assert _sqla_database.sync is not None, "the dispatcher checked the URL"
+    engine = sync_engine(_sqla_database.sync, sqla_engine_options)
     yield engine
     engine.dispose()
 
@@ -317,7 +418,7 @@ def _sqla_sync_transaction(
 
 @pytest.fixture(scope="session")
 def _sqla_async_engine_function(
-    _sqla_urls: Targets, sqla_engine_options: dict[str, Any], _sqla_sqlite_keeper: object
+    _sqla_database: Targets, sqla_engine_options: dict[str, Any], _sqla_sqlite_keeper: object
 ) -> Iterator[AsyncEngine]:
     """Serves per-test loops and anyio tests: NullPool, so no connection outlives its loop.
 
@@ -326,8 +427,8 @@ def _sqla_async_engine_function(
     localhost Docker: 3.9 ms (psycopg) to 5.5 ms (asyncpg) on PostgreSQL, and
     1.2 ms on MySQL (aiomysql, asyncmy).
     """
-    assert _sqla_urls.asynchronous is not None, "the dispatcher checked the URL"
-    engine = async_engine(_sqla_urls.asynchronous, sqla_engine_options, pooled=False)
+    assert _sqla_database.asynchronous is not None, "the dispatcher checked the URL"
+    engine = async_engine(_sqla_database.asynchronous, sqla_engine_options, pooled=False)
     yield engine
     engine.sync_engine.dispose()
 

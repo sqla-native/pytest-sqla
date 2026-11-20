@@ -33,7 +33,9 @@ def test_the_command_line_beats_the_environment_and_the_ini(
     monkeypatch.setenv("PYTEST_SQLA_URL", "sqlite:///env.db")
     result = urls(project, "--sqla-url", "sqlite:///cli.db")
     result.stdout.fnmatch_lines(["sqla_url: sqlite:///cli.db", "sqla_async_url: sqlite:///cli.db"])
-    result.stdout.fnmatch_lines(["sqla: url=sqlite:///cli.db (from --sqla-url), schema=create"])
+    result.stdout.fnmatch_lines(
+        ["sqla: url=sqlite:///cli.db (from --sqla-url), schema=create, database=configured"]
+    )
 
 
 def test_the_environment_beats_the_ini(project: Project, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -42,7 +44,7 @@ def test_the_environment_beats_the_ini(project: Project, monkeypatch: pytest.Mon
     result = urls(project)
     result.stdout.fnmatch_lines(["sqla_url: sqlite:///env.db"])
     result.stdout.fnmatch_lines(
-        ["sqla: url=sqlite:///env.db (from PYTEST_SQLA_URL), schema=create"]
+        ["sqla: url=sqlite:///env.db (from PYTEST_SQLA_URL), schema=create, database=configured"]
     )
 
 
@@ -51,7 +53,7 @@ def test_the_ini_is_the_committed_default(project: Project) -> None:
     result = urls(project)
     result.stdout.fnmatch_lines(["sqla_url: sqlite:///ini.db"])
     result.stdout.fnmatch_lines(
-        ["sqla: url=sqlite:///ini.db (from the sqla_url ini key), schema=none"]
+        ["sqla: url=sqlite:///ini.db (from the sqla_url ini key), schema=none, database=configured"]
     )
 
 
@@ -67,7 +69,8 @@ def test_the_async_url_has_the_same_precedence(
     result.stdout.fnmatch_lines(
         [
             "sqla: url=sqlite:///a.db (from the sqla_url ini key), "
-            "async_url=sqlite+aiosqlite:///./a.db (from --sqla-async-url), schema=create"
+            "async_url=sqlite+aiosqlite:///./a.db (from --sqla-async-url), schema=create, "
+            "database=configured"
         ]
     )
 
@@ -80,7 +83,10 @@ def test_the_async_url_comes_from_the_environment_before_the_ini(
     result = urls(project)
     result.stdout.fnmatch_lines(["sqla_url: None", "sqla_async_url: sqlite+aiosqlite:///env.db"])
     result.stdout.fnmatch_lines(
-        ["sqla: async_url=sqlite+aiosqlite:///env.db (from PYTEST_SQLA_ASYNC_URL), schema=create"]
+        [
+            "sqla: async_url=sqlite+aiosqlite:///env.db (from PYTEST_SQLA_ASYNC_URL), "
+            "schema=create, database=configured"
+        ]
     )
 
 
@@ -95,7 +101,10 @@ def test_the_header_hides_the_password(project: Project) -> None:
     result = project.run("--sqla-url", "postgresql+psycopg://ada:s3cret@db.example/app")
     result.assert_outcomes(passed=1)
     result.stdout.fnmatch_lines(
-        ["sqla: url=postgresql+psycopg://ada:***@db.example/app (from --sqla-url), schema=create"]
+        [
+            "sqla: url=postgresql+psycopg://ada:***@db.example/app (from --sqla-url), "
+            "schema=create, database=configured"
+        ]
     )
     assert "s3cret" not in result.stdout.str()
 
